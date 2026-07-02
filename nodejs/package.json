@@ -1,0 +1,24 @@
+{
+  "name": "pgbackup-node",
+  "version": "0.1.0",
+  "description": "PostgreSQL backup / restore / versioning tool (Node.js edition) - CLI and local Web UI",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "bin": {
+    "pgbackup-js": "bin/pgbackup.js"
+  },
+  "scripts": {
+    "start": "node bin/pgbackup.js",
+    "web": "node bin/pgbackup.js web",
+    "test:cli": "node tests/e2e_cli.test.js",
+    "test:web": "node tests/e2e_web.test.js"
+  },
+  "dependencies": {
+    "commander": "^15.0.0",
+    "express": "^5.2.1",
+    "pg": "^8.22.0"
+  }
+}

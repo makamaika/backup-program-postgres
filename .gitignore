@@ -19,3 +19,4 @@ backups/
 Thumbs.db
 .DS_Store
 .claude/launch.json
+node_modules/
