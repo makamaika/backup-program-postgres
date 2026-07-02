@@ -1,0 +1,697 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pgbackup — PostgreSQL バックアップ管理</title>
+<style>
+  :root {
+    --bg: #f5f7fa; --panel: #ffffff; --border: #dde3ea;
+    --text: #1f2933; --muted: #6b7a8c; --accent: #2563eb; --accent-dark: #1e40af;
+    --ok: #15803d; --err: #b91c1c; --warn: #b45309;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "Segoe UI", "Hiragino Sans", "Meiryo", sans-serif;
+         background: var(--bg); color: var(--text); font-size: 14px; }
+  header { background: #0f2647; color: #fff; padding: 10px 20px; display: flex;
+           align-items: baseline; gap: 14px; }
+  header h1 { font-size: 18px; margin: 0; }
+  header .sub { color: #9db4d4; font-size: 12px; }
+  nav { display: flex; gap: 2px; background: #0f2647; padding: 0 12px; }
+  nav button { background: transparent; color: #b9c9e0; border: none; padding: 10px 16px;
+               cursor: pointer; font-size: 14px; border-radius: 6px 6px 0 0; }
+  nav button.active { background: var(--bg); color: var(--text); font-weight: 600; }
+  main { padding: 18px 20px 80px; max-width: 1280px; margin: 0 auto; }
+  h2 { font-size: 16px; margin: 0 0 12px; }
+  h3 { font-size: 14px; margin: 18px 0 8px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+           padding: 14px 16px; margin-bottom: 14px; }
+  table { border-collapse: collapse; width: 100%; background: var(--panel); }
+  th, td { border: 1px solid var(--border); padding: 6px 10px; text-align: left;
+           font-size: 13px; vertical-align: top; }
+  th { background: #eef2f7; font-weight: 600; white-space: nowrap; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .scroll { overflow-x: auto; }
+  button, .btn { background: var(--accent); color: #fff; border: none; border-radius: 6px;
+           padding: 7px 14px; cursor: pointer; font-size: 13px; }
+  button:hover { background: var(--accent-dark); }
+  button.secondary { background: #e5eaf1; color: var(--text); }
+  button.secondary:hover { background: #d4dce7; }
+  button.danger { background: var(--err); }
+  button.small { padding: 3px 9px; font-size: 12px; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  input, select, textarea { border: 1px solid var(--border); border-radius: 6px;
+           padding: 6px 9px; font-size: 13px; background: #fff; color: var(--text); }
+  label { display: inline-flex; align-items: center; gap: 6px; margin: 4px 0; }
+  .form-grid { display: grid; grid-template-columns: 130px 1fr; gap: 8px 12px;
+               align-items: center; max-width: 560px; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
+  .badge.ok { background: #dcfce7; color: var(--ok); }
+  .badge.err { background: #fee2e2; color: var(--err); }
+  .badge.run { background: #dbeafe; color: var(--accent-dark); }
+  .badge.mode { background: #ede9fe; color: #5b21b6; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .mono { font-family: Consolas, monospace; }
+  .cols { display: flex; gap: 16px; align-items: flex-start; }
+  .cols > .side { width: 320px; flex-shrink: 0; }
+  .cols > .grow { flex-grow: 1; min-width: 0; }
+  .treeitem { padding: 4px 8px; border-radius: 5px; cursor: pointer; display: flex;
+              justify-content: space-between; gap: 6px; }
+  .treeitem:hover { background: #eef2f7; }
+  .treeitem.active { background: #dbeafe; }
+  .schema-head { font-weight: 600; margin: 8px 0 2px; color: var(--accent-dark); }
+  #toast { position: fixed; top: 14px; right: 14px; z-index: 50; display: flex;
+           flex-direction: column; gap: 8px; }
+  .toast { padding: 10px 16px; border-radius: 8px; color: #fff; max-width: 420px;
+           box-shadow: 0 4px 14px rgba(0,0,0,.2); white-space: pre-wrap; }
+  .toast.ok { background: var(--ok); } .toast.err { background: var(--err); }
+  #jobs-panel { position: fixed; bottom: 0; right: 16px; width: 420px; z-index: 40; }
+  .job { background: #fff; border: 1px solid var(--border); border-bottom: none;
+         border-radius: 8px 8px 0 0; padding: 10px 12px; box-shadow: 0 -2px 10px rgba(0,0,0,.08);
+         margin-top: 6px; }
+  .job .log { max-height: 110px; overflow-y: auto; background: #f3f5f8; border-radius: 5px;
+              padding: 6px 8px; font-size: 12px; margin-top: 6px; }
+  dialog { border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px;
+           min-width: 420px; }
+  dialog::backdrop { background: rgba(15,38,71,.45); }
+  .checklist { max-height: 220px; overflow-y: auto; border: 1px solid var(--border);
+               border-radius: 6px; padding: 6px 10px; background: #fff; }
+  .kpi { display: inline-block; background: #eef2f7; border-radius: 8px; padding: 8px 14px;
+         margin: 0 8px 8px 0; }
+  .kpi b { font-size: 17px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>pgbackup</h1>
+  <span class="sub">PostgreSQL バックアップ / リストア / バージョン管理</span>
+</header>
+<nav id="nav">
+  <button data-view="conn">接続</button>
+  <button data-view="browse" class="active">データベース</button>
+  <button data-view="backup">バックアップ</button>
+  <button data-view="versions">バージョン・リストア</button>
+  <button data-view="history">履歴</button>
+</nav>
+<main id="main"></main>
+<div id="toast"></div>
+<div id="jobs-panel"></div>
+
+<dialog id="dlg-restore">
+  <h2 style="margin-top:0">リストア</h2>
+  <div class="muted mono" id="dlg-restore-target"></div>
+  <div class="form-grid" style="margin-top:10px">
+    <span>復元先サーバー</span><select id="dlg-restore-dest"></select>
+    <span>復元先 DB 名</span><input id="dlg-restore-db" placeholder="(元と同名)">
+    <span></span><label><input type="checkbox" id="dlg-restore-drop"> 既存 DB を削除して作り直す</label>
+  </div>
+  <div class="row" style="justify-content:flex-end; margin-top:14px">
+    <button class="secondary" onclick="document.getElementById('dlg-restore').close()">キャンセル</button>
+    <button id="dlg-restore-go">リストア実行</button>
+  </div>
+</dialog>
+
+<script>
+"use strict";
+const $ = (sel, el) => (el || document).querySelector(sel);
+const $$ = (sel, el) => Array.from((el || document).querySelectorAll(sel));
+const esc = s => s == null ? "" : String(s)
+  .replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
+  .replaceAll('"',"&quot;").replaceAll("'","&#39;");
+const enc = encodeURIComponent;
+
+function toast(msg, kind) {
+  const el = document.createElement("div");
+  el.className = "toast " + (kind || "ok");
+  el.textContent = msg;
+  $("#toast").appendChild(el);
+  setTimeout(() => el.remove(), kind === "err" ? 9000 : 4000);
+}
+
+async function api(path, opts) {
+  const res = await fetch(path, opts && opts.body ? {
+    method: opts.method || "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(opts.body),
+  } : opts);
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* 空レスポンス */ }
+  if (!res.ok) {
+    const msg = data && data.detail ? (typeof data.detail === "string" ? data.detail
+      : JSON.stringify(data.detail)) : res.status + " " + res.statusText;
+    throw new Error(msg);
+  }
+  return data;
+}
+
+function sizeFmt(n) {
+  if (n == null) return "";
+  let x = Number(n);
+  for (const u of ["B","KB","MB","GB","TB"]) {
+    if (x < 1024 || u === "TB") return u === "B" ? x + "B" : x.toFixed(1) + u;
+    x /= 1024;
+  }
+}
+
+// 二重送信ガード: 処理中はボタンを無効化する
+async function withDisabled(btn, fn) {
+  if (btn.disabled) return;
+  btn.disabled = true;
+  try { return await fn(); } finally { btn.disabled = false; }
+}
+
+// ---------------------------------------------------------------- ジョブ表示
+
+const watchedJobs = new Map();
+async function watchJob(jobId, onDone) {
+  watchedJobs.set(jobId, { onDone, fails: 0 });
+  renderJobs();
+  const timer = setInterval(async () => {
+    const w = watchedJobs.get(jobId);
+    if (!w) { clearInterval(timer); return; }  // ユーザーが × で閉じた
+    try {
+      const job = await api("/api/jobs/" + jobId);
+      w.job = job;
+      w.fails = 0;
+      renderJobs();
+      if (job.status !== "running") {
+        clearInterval(timer);
+        if (job.status === "done") { toast(job.title + " — 完了"); if (onDone) onDone(job); }
+        else toast(job.title + " — 失敗:\n" + (job.error || ""), "err");
+      }
+    } catch (e) {
+      // 一時的な通信断で追跡を止めない (5 回連続で失敗したら諦めて通知)
+      w.fails++;
+      if (w.fails >= 5) {
+        clearInterval(timer);
+        toast("ジョブ状態の取得に失敗しました (履歴タブで結果を確認してください): " + e.message, "err");
+      }
+    }
+  }, 1000);
+}
+
+function renderJobs() {
+  const panel = $("#jobs-panel");
+  // 再描画でログのスクロール位置が飛ばないよう保存する
+  const scrolls = new Map();
+  $$(".job", panel).forEach(el => {
+    const log = $(".log", el);
+    if (log) scrolls.set(el.dataset.jobid, {
+      top: log.scrollTop,
+      atBottom: log.scrollTop + log.clientHeight >= log.scrollHeight - 4,
+    });
+  });
+  panel.innerHTML = "";
+  for (const [id, w] of watchedJobs) {
+    const job = w.job || { title: "開始中…", status: "running", log: [] };
+    const div = document.createElement("div");
+    div.className = "job";
+    div.dataset.jobid = id;
+    const badge = job.status === "running" ? '<span class="badge run">実行中</span>'
+      : job.status === "done" ? '<span class="badge ok">完了</span>'
+      : '<span class="badge err">失敗</span>';
+    div.innerHTML = `<div class="row" style="justify-content:space-between;margin:0">
+        <b style="font-size:13px">${esc(job.title)}</b>
+        <span>${badge} <button class="small secondary" data-close="${id}">×</button></span>
+      </div>
+      ${job.error ? `<div style="color:var(--err);font-size:12px;white-space:pre-wrap">${esc(job.error)}</div>` : ""}
+      <div class="log mono">${(job.log || []).map(l => esc(l)).join("<br>")}</div>`;
+    div.querySelector("[data-close]").onclick = () => { watchedJobs.delete(id); renderJobs(); };
+    panel.appendChild(div);
+    const log = $(".log", div);
+    const prev = scrolls.get(id);
+    if (log) log.scrollTop = (!prev || prev.atBottom) ? log.scrollHeight : prev.top;
+  }
+}
+
+// ---------------------------------------------------------------- ビュー管理
+
+const state = { view: "browse", profiles: [], browse: {}, backup: {}, versions: {} };
+
+async function loadProfiles() {
+  state.profiles = await api("/api/profiles");
+}
+
+function profileOptions(selected) {
+  return state.profiles.map(p =>
+    `<option value="${esc(p.name)}" ${p.name === selected ? "selected" : ""}>` +
+    `${esc(p.name)} (${esc(p.user)}@${esc(p.host)}:${p.port})</option>`).join("");
+}
+
+async function show(view) {
+  state.view = view;
+  $$("#nav button").forEach(b => b.classList.toggle("active", b.dataset.view === view));
+  try {
+    await loadProfiles();
+  } catch (e) {
+    state.profiles = [];
+    toast("プロファイル一覧の取得に失敗しました: " + e.message, "err");
+  }
+  const main = $("#main");
+  if (view === "conn") renderConn(main);
+  else if (view === "browse") renderBrowse(main);
+  else if (view === "backup") renderBackup(main);
+  else if (view === "versions") renderVersions(main);
+  else if (view === "history") renderHistory(main);
+}
+
+$$("#nav button").forEach(b => b.onclick = () => show(b.dataset.view));
+
+// ---------------------------------------------------------------- 接続ビュー
+
+function renderConn(main) {
+  main.innerHTML = `
+    <h2>接続プロファイル</h2>
+    <div class="panel">
+      <div class="scroll"><table id="conn-table"></table></div>
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0">プロファイルの追加</h3>
+      <div class="form-grid">
+        <span>名前</span><input id="c-name" placeholder="例: local, production">
+        <span>ホスト</span><input id="c-host" value="localhost">
+        <span>ポート</span><input id="c-port" type="number" value="5432">
+        <span>ユーザー</span><input id="c-user" value="postgres">
+        <span>パスワード</span><input id="c-pass" type="password">
+        <span>メンテ用 DB</span><input id="c-db" value="postgres">
+        <span>SSL モード</span><select id="c-ssl">
+          <option value="">(指定なし)</option><option>require</option>
+          <option>verify-ca</option><option>verify-full</option></select>
+        <span></span><label><input type="checkbox" id="c-overwrite"> 同名なら上書き</label>
+      </div>
+      <div class="row"><button id="c-add">追加</button>
+        <span class="muted">パスワードはローカルの connections.json に保存されます。</span></div>
+    </div>`;
+  const tbl = $("#conn-table");
+  const rowsHtml = state.profiles.map(p => `<tr>
+      <td><b>${esc(p.name)}</b></td>
+      <td class="mono">${esc(p.host)}:${p.port}</td>
+      <td>${esc(p.user)}</td>
+      <td>
+        <button class="small secondary" data-test="${esc(p.name)}">接続テスト</button>
+        <button class="small danger" data-del="${esc(p.name)}">削除</button>
+      </td></tr>`).join("") ||
+    `<tr><td colspan="4" class="muted">プロファイルがありません。下のフォームから追加してください。</td></tr>`;
+  tbl.innerHTML = `<tr><th>名前</th><th>接続先</th><th>ユーザー</th><th></th></tr>` + rowsHtml;
+  $$("[data-test]", tbl).forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    try {
+      const r = await api(`/api/profiles/${enc(b.dataset.test)}/test`, { method: "POST" });
+      r.ok ? toast(`接続 OK — PostgreSQL ${r.server_version}`) : toast(r.error, "err");
+    } catch (e) { toast(e.message, "err"); }
+    b.disabled = false;
+  });
+  $$("[data-del]", tbl).forEach(b => b.onclick = async () => {
+    if (!confirm(`プロファイル '${b.dataset.del}' を削除しますか?`)) return;
+    try { await api(`/api/profiles/${enc(b.dataset.del)}`, { method: "DELETE" });
+      toast("削除しました"); show("conn"); } catch (e) { toast(e.message, "err"); }
+  });
+  $("#c-add").onclick = e => withDisabled(e.target, async () => {
+    try {
+      await api("/api/profiles", { body: {
+        name: $("#c-name").value.trim(), host: $("#c-host").value.trim(),
+        port: Number($("#c-port").value), user: $("#c-user").value.trim(),
+        password: $("#c-pass").value || null, dbname: $("#c-db").value.trim() || "postgres",
+        sslmode: $("#c-ssl").value || null, overwrite: $("#c-overwrite").checked,
+      }});
+      toast("プロファイルを追加しました"); show("conn");
+    } catch (e2) { toast(e2.message, "err"); }
+  });
+}
+
+// ---------------------------------------------------------------- DB ブラウズビュー
+
+function renderBrowse(main) {
+  const st = state.browse;
+  main.innerHTML = `
+    <h2>データベースの参照</h2>
+    <div class="panel row">
+      <span>サーバー:</span>
+      <select id="b-profile">${profileOptions(st.profile)}</select>
+      <button id="b-load" class="secondary">DB 一覧を表示</button>
+      <span class="muted" id="b-server-info"></span>
+    </div>
+    <div id="b-dbs"></div>
+    <div id="b-structure"></div>`;
+  if (!state.profiles.length) {
+    $("#b-dbs").innerHTML = `<div class="panel muted">先に「接続」タブでプロファイルを登録してください。</div>`;
+    return;
+  }
+  $("#b-load").onclick = () => loadDbList();
+  if (st.profile && state.profiles.some(p => p.name === st.profile)) loadDbList();
+
+  async function loadDbList() {
+    st.profile = $("#b-profile").value;
+    const target = $("#b-dbs");
+    target.innerHTML = `<div class="panel muted">読み込み中…</div>`;
+    try {
+      const dbs = await api(`/api/databases?profile=${enc(st.profile)}`);
+      target.innerHTML = `<div class="panel"><div class="scroll"><table>
+        <tr><th>データベース</th><th>所有者</th><th>エンコーディング</th><th>サイズ</th><th></th></tr>
+        ${dbs.map(d => `<tr>
+          <td><b>${esc(d.name)}</b></td><td>${esc(d.owner)}</td><td>${esc(d.encoding)}</td>
+          <td class="num">${esc(d.size || "")}</td>
+          <td><button class="small" data-open="${esc(d.name)}">構造を見る</button></td>
+        </tr>`).join("")}</table></div></div>`;
+      $$("[data-open]", target).forEach(b => b.onclick = () => loadStructure(b.dataset.open));
+      if (st.db && dbs.some(d => d.name === st.db)) loadStructure(st.db);
+    } catch (e) { target.innerHTML = ""; toast(e.message, "err"); }
+  }
+
+  async function loadStructure(db) {
+    st.db = db;
+    const target = $("#b-structure");
+    target.innerHTML = `<div class="panel muted">構造を読み込み中…</div>`;
+    try {
+      const s = await api(`/api/structure?profile=${enc(st.profile)}&db=${enc(db)}`);
+      const nTables = s.schemas.reduce((a, sc) => a + sc.tables.length, 0);
+      target.innerHTML = `
+        <h2 style="margin-top:20px">構造: <span class="mono">${esc(db)}</span></h2>
+        <div class="panel">
+          <span class="kpi">スキーマ <b>${s.schemas.length}</b></span>
+          <span class="kpi">テーブル等 <b>${nTables}</b></span>
+          <h3>保存されているデータ型の内訳</h3>
+          <div class="scroll"><table>
+            <tr><th>データ型</th><th>カラム数</th><th>使用テーブル数</th></tr>
+            ${s.datatype_summary.map(d => `<tr><td class="mono">${esc(d.data_type)}</td>
+              <td class="num">${d.column_count}</td><td class="num">${d.table_count}</td></tr>`).join("")
+              || "<tr><td colspan=3 class=muted>(ユーザーテーブルなし)</td></tr>"}
+          </table></div>
+        </div>
+        <div class="cols">
+          <div class="side panel">
+            ${s.schemas.map(sc => `
+              <div class="schema-head">📁 ${esc(sc.name)}</div>
+              ${sc.tables.map(t => `
+                <div class="treeitem" data-schema="${esc(sc.name)}" data-table="${esc(t.name)}">
+                  <span>${t.kind === "view" || t.kind === "materialized view" ? "👁" : "▤"}
+                    ${esc(t.name)}</span>
+                  <span class="muted">${t.est_rows != null ? Number(t.est_rows).toLocaleString() + "行" : ""}</span>
+                </div>`).join("")}`).join("") || "<div class=muted>(スキーマなし)</div>"}
+          </div>
+          <div class="grow" id="b-table-detail">
+            <div class="panel muted">左のテーブルを選択すると、カラム定義・インデックス・データのサンプルを表示します。</div>
+          </div>
+        </div>`;
+      $$(".treeitem", target).forEach(el => el.onclick = () => {
+        $$(".treeitem", target).forEach(x => x.classList.remove("active"));
+        el.classList.add("active");
+        loadTable(el.dataset.schema, el.dataset.table);
+      });
+    } catch (e) { target.innerHTML = ""; toast(e.message, "err"); }
+  }
+
+  async function loadTable(schema, table) {
+    const target = $("#b-table-detail");
+    target.innerHTML = `<div class="panel muted">読み込み中…</div>`;
+    const q = `profile=${enc(st.profile)}&db=${enc(st.db)}&schema=${enc(schema)}&table=${enc(table)}`;
+    try {
+      const d = await api(`/api/table?${q}`);
+      target.innerHTML = `<div class="panel">
+        <h3 style="margin-top:0">▤ ${esc(schema)}.${esc(table)}</h3>
+        <div class="scroll"><table>
+          <tr><th>カラム</th><th>型</th><th>NULL 可</th><th>デフォルト</th><th>PK</th></tr>
+          ${d.columns.map(c => `<tr>
+            <td><b>${esc(c.name)}</b></td><td class="mono">${esc(c.data_type)}</td>
+            <td>${c.nullable ? "○" : "×"}</td><td class="mono">${esc(c.default || "")}</td>
+            <td>${c.is_primary_key ? "🔑" : ""}</td></tr>`).join("")}
+        </table></div>
+        ${d.indexes.length ? `<h3>インデックス</h3><div class="scroll"><table>
+          <tr><th>名前</th><th>定義</th></tr>
+          ${d.indexes.map(i => `<tr><td>${esc(i.name)}</td><td class="mono">${esc(i.definition)}</td></tr>`).join("")}
+        </table></div>` : ""}
+        <div class="row" style="margin-top:12px">
+          <button id="b-sample" class="secondary">データのサンプルを表示</button>
+          <select id="b-sample-n"><option>10</option><option>50</option><option>100</option></select>
+          <span>行</span>
+        </div>
+        <div id="b-sample-out"></div>
+      </div>`;
+      $("#b-sample").onclick = async () => {
+        const out = $("#b-sample-out");
+        out.innerHTML = `<div class="muted">読み込み中…</div>`;
+        try {
+          const s = await api(`/api/sample?${q}&limit=` + $("#b-sample-n").value);
+          const totalLabel = s.approx
+            ? `約 ${Number(s.total_rows).toLocaleString()} (推定)`
+            : Number(s.total_rows).toLocaleString();
+          out.innerHTML = `<div class="muted" style="margin:6px 0">総行数: ${totalLabel}</div>
+            <div class="scroll"><table>
+            <tr>${s.columns.map(c => `<th>${esc(c)}</th>`).join("")}</tr>
+            ${s.rows.map(r => `<tr>${r.map(v => `<td>${v === null ? '<span class="muted">NULL</span>' : esc(v)}</td>`).join("")}</tr>`).join("")
+              || `<tr><td colspan="${s.columns.length}" class="muted">(データなし)</td></tr>`}
+          </table></div>`;
+        } catch (e) { out.innerHTML = ""; toast(e.message, "err"); }
+      };
+    } catch (e) { target.innerHTML = ""; toast(e.message, "err"); }
+  }
+}
+
+// ---------------------------------------------------------------- バックアップビュー
+
+function renderBackup(main) {
+  const st = state.backup;
+  main.innerHTML = `
+    <h2>バックアップの実行</h2>
+    <div class="panel">
+      <div class="row"><span>バックアップ元サーバー:</span>
+        <select id="k-profile">${profileOptions(st.profile)}</select>
+        <button id="k-load" class="secondary">DB 一覧を読み込む</button></div>
+      <div id="k-dblist" class="muted">DB 一覧を読み込んでください。</div>
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0">モード</h3>
+      <div class="row">
+        <label><input type="radio" name="k-mode" value="file" checked>
+          <b>ファイル出力</b> — SQL / ダンプファイルとして保存 (バージョン管理対象)</label></div>
+      <div class="row">
+        <label><input type="radio" name="k-mode" value="archive">
+          <b>アーカイブ</b> — 指定サーバーの BACK_UP_DB にすべてのバックアップを蓄積</label></div>
+      <div class="row">
+        <label><input type="radio" name="k-mode" value="clone">
+          <b>複製 (クローン)</b> — DB をそのまま別の DB として複製 (ローカル⇔リモート任意)</label></div>
+
+      <div id="k-opt-file" class="form-grid" style="margin-top:10px">
+        <span>形式</span><select id="k-fmt">
+          <option value="plain">plain — SQL ファイル (.sql)</option>
+          <option value="custom">custom — pg_restore 用 (.dump, 圧縮)</option></select>
+      </div>
+      <div id="k-opt-archive" class="form-grid" style="display:none; margin-top:10px">
+        <span>保存先サーバー</span><select id="k-arch-dest"><option value="">(元と同じサーバー)</option>
+          ${state.profiles.map(p => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("")}</select>
+        <span>アーカイブ DB 名</span><input id="k-arch-db" value="BACK_UP_DB">
+      </div>
+      <div id="k-opt-clone" class="form-grid" style="display:none; margin-top:10px">
+        <span>複製先サーバー</span><select id="k-clone-dest">${profileOptions()}</select>
+        <span>複製先 DB 名</span><input id="k-clone-db" placeholder="(元と同名 / 対象 1 DB のときのみ変更可)">
+        <span></span><label><input type="checkbox" id="k-drop"> 複製先に同名 DB があれば削除して作り直す</label>
+        <span></span><label><input type="checkbox" id="k-keep-owner"> 所有者・権限も複製する</label>
+      </div>
+      <div class="form-grid" style="margin-top:6px">
+        <span>メモ</span><input id="k-note" placeholder="(任意) このバックアップの説明">
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button id="k-run">バックアップ実行</button>
+        <span class="muted">実行状況は右下のジョブパネルに表示されます。</span>
+      </div>
+    </div>`;
+
+  if (!state.profiles.length) {
+    $("#k-dblist").innerHTML = `先に「接続」タブでプロファイルを登録してください。`;
+  }
+
+  $$("input[name=k-mode]").forEach(r => r.onchange = () => {
+    const m = $("input[name=k-mode]:checked").value;
+    $("#k-opt-file").style.display = m === "file" ? "grid" : "none";
+    $("#k-opt-archive").style.display = m === "archive" ? "grid" : "none";
+    $("#k-opt-clone").style.display = m === "clone" ? "grid" : "none";
+  });
+
+  async function loadDbs() {
+    st.profile = $("#k-profile").value;
+    const out = $("#k-dblist");
+    out.innerHTML = "読み込み中…";
+    try {
+      const dbs = await api(`/api/databases?profile=${enc(st.profile)}`);
+      out.className = "";
+      out.innerHTML = `
+        <label style="margin:8px 0"><input type="checkbox" id="k-all">
+          <b>すべての DB</b> (テンプレート・アーカイブ DB を除く)</label>
+        <div class="checklist" id="k-checks">
+          ${dbs.map(d => `<label style="display:flex"><input type="checkbox" value="${esc(d.name)}">
+            ${esc(d.name)} <span class="muted">(${esc(d.size || "")})</span></label>`).join("")}
+        </div>`;
+      $("#k-all").onchange = () =>
+        $$("#k-checks input").forEach(c => c.disabled = $("#k-all").checked);
+    } catch (e) { out.innerHTML = ""; toast(e.message, "err"); }
+  }
+  $("#k-load").onclick = loadDbs;
+  // プロファイルを切り替えたら古い DB リストを使い回さない
+  $("#k-profile").onchange = loadDbs;
+  if (st.profile && state.profiles.some(p => p.name === st.profile)) loadDbs();
+
+  $("#k-run").onclick = e => withDisabled(e.target, async () => {
+    if (!st.profile || st.profile !== $("#k-profile").value || !$("#k-checks")) {
+      toast("先に「DB 一覧を読み込む」を実行してください", "err");
+      return;
+    }
+    const mode = $("input[name=k-mode]:checked").value;
+    const all = $("#k-all") && $("#k-all").checked;
+    const dbs = all ? [] : $$("#k-checks input:checked").map(c => c.value);
+    if (!all && !dbs.length) { toast("対象 DB を選択してください", "err"); return; }
+    const body = {
+      profile: st.profile, dbs, all, mode,
+      note: $("#k-note").value || null,
+      archive_db: $("#k-arch-db").value.trim() || "BACK_UP_DB",
+    };
+    if (mode === "file") body.fmt = $("#k-fmt").value;
+    if (mode === "archive") body.dest = $("#k-arch-dest").value || null;
+    if (mode === "clone") {
+      body.dest = $("#k-clone-dest").value;
+      body.dest_db = $("#k-clone-db").value.trim() || null;
+      body.drop = $("#k-drop").checked;
+      body.keep_owner = $("#k-keep-owner").checked;
+    }
+    try {
+      const r = await api("/api/backup", { body });
+      watchJob(r.job_id, () => { if (state.view === "versions") show("versions"); });
+    } catch (e2) { toast(e2.message, "err"); }
+  });
+}
+
+// ---------------------------------------------------------------- バージョンビュー
+
+function renderVersions(main) {
+  main.innerHTML = `
+    <h2>バージョン管理・リストア</h2>
+    <div class="panel">
+      <h3 style="margin-top:0">ローカルカタログのバックアップ一覧</h3>
+      <div id="v-list" class="scroll">読み込み中…</div>
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0">アーカイブ DB (BACK_UP_DB) の中身</h3>
+      <div class="row">
+        <span>サーバー:</span><select id="v-arch-profile">${profileOptions()}</select>
+        <span>アーカイブ DB:</span><input id="v-arch-db" value="BACK_UP_DB" style="width:140px">
+        <button id="v-arch-load" class="secondary">表示</button>
+      </div>
+      <div id="v-arch-list" class="scroll"></div>
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0">ダンプファイルから直接リストア</h3>
+      <div class="form-grid">
+        <span>ファイルパス</span><input id="v-file-path" placeholder="C:\\path\\to\\backup.sql (.sql / .dump)">
+        <span>復元先サーバー</span><select id="v-file-dest">${profileOptions()}</select>
+        <span>復元先 DB 名</span><input id="v-file-db">
+        <span></span><label><input type="checkbox" id="v-file-drop"> 既存 DB を削除して作り直す</label>
+      </div>
+      <div class="row"><button id="v-file-go">リストア実行</button>
+      <span class="muted">サーバー上のローカルパスを指定します。</span></div>
+    </div>`;
+
+  loadVersionList();
+  $("#v-arch-load").onclick = loadArchList;
+
+  async function loadVersionList() {
+    const out = $("#v-list");
+    try {
+      const rows = await api("/api/versions");
+      out.innerHTML = `<table>
+        <tr><th>バージョン</th><th>モード</th><th>形式</th><th>サイズ</th><th>作成日時 (UTC)</th>
+            <th>保存先</th><th>メモ</th><th></th></tr>
+        ${rows.map(r => `<tr>
+          <td class="mono"><b>${esc(r.version_id)}</b></td>
+          <td><span class="badge mode">${esc(r.mode)}</span></td>
+          <td>${esc(r.fmt)}</td><td class="num">${sizeFmt(r.size)}</td>
+          <td class="mono">${esc(r.created_at)}</td>
+          <td class="mono" style="max-width:280px;overflow-wrap:anywhere">
+            ${esc(r.mode === "file" ? r.location : r.archive_profile + ":" + r.archive_db)}</td>
+          <td>${esc(r.note || "")}</td>
+          <td><button class="small" data-restore="${esc(r.version_id)}" data-db="${esc(r.db)}">リストア</button></td>
+        </tr>`).join("") || `<tr><td class="muted" colspan="8">バックアップがまだありません。</td></tr>`}
+      </table>`;
+      $$("[data-restore]", out).forEach(b => b.onclick = () =>
+        openRestoreDialog(b.dataset.restore, b.dataset.db, body =>
+          api("/api/restore", { body: { version_id: b.dataset.restore, ...body } })));
+    } catch (e) { out.innerHTML = ""; toast(e.message, "err"); }
+  }
+
+  async function loadArchList() {
+    const out = $("#v-arch-list");
+    const profile = $("#v-arch-profile").value;
+    const archDb = $("#v-arch-db").value.trim() || "BACK_UP_DB";
+    out.innerHTML = "読み込み中…";
+    try {
+      const rows = await api(`/api/archive?profile=${enc(profile)}&archive_db=${enc(archDb)}`);
+      out.innerHTML = `<table style="margin-top:8px">
+        <tr><th>バージョン</th><th>元 DB</th><th>サイズ</th><th>作成日時</th><th>メモ</th><th></th></tr>
+        ${rows.map(r => `<tr>
+          <td class="mono"><b>${esc(r.version_id)}</b></td><td>${esc(r.source_db)}</td>
+          <td class="num">${sizeFmt(r.size)}</td><td class="mono">${esc(r.created_at)}</td>
+          <td>${esc(r.note || "")}</td>
+          <td><button class="small" data-arestore="${esc(r.version_id)}" data-db="${esc(r.source_db)}">リストア</button></td>
+        </tr>`).join("") || `<tr><td class="muted" colspan="6">アーカイブは空です。</td></tr>`}
+      </table>`;
+      $$("[data-arestore]", out).forEach(b => b.onclick = () =>
+        openRestoreDialog(b.dataset.arestore, b.dataset.db, body =>
+          api("/api/restore-archive", { body: {
+            profile, archive_db: archDb, version_id: b.dataset.arestore, ...body } })));
+    } catch (e) { out.innerHTML = ""; toast(e.message, "err"); }
+  }
+
+  $("#v-file-go").onclick = e => withDisabled(e.target, async () => {
+    const path = $("#v-file-path").value.trim();
+    const db = $("#v-file-db").value.trim();
+    if (!path || !db) { toast("ファイルパスと復元先 DB 名を入力してください", "err"); return; }
+    try {
+      const r = await api("/api/restore-file", { body: {
+        path, dest: $("#v-file-dest").value, db, drop: $("#v-file-drop").checked } });
+      watchJob(r.job_id, () => loadVersionList());
+    } catch (e2) { toast(e2.message, "err"); }
+  });
+}
+
+function openRestoreDialog(versionId, defaultDb, submitFn) {
+  const dlg = $("#dlg-restore");
+  $("#dlg-restore-target").textContent = versionId;
+  $("#dlg-restore-dest").innerHTML = profileOptions();
+  $("#dlg-restore-db").value = "";
+  $("#dlg-restore-db").placeholder = defaultDb || "(元と同名)";
+  $("#dlg-restore-drop").checked = false;
+  $("#dlg-restore-go").onclick = e => withDisabled(e.target, async () => {
+    try {
+      const r = await submitFn({
+        dest: $("#dlg-restore-dest").value,
+        db: $("#dlg-restore-db").value.trim() || null,
+        drop: $("#dlg-restore-drop").checked,
+      });
+      dlg.close();
+      watchJob(r.job_id);
+    } catch (e2) { toast(e2.message, "err"); }
+  });
+  dlg.showModal();
+}
+
+// ---------------------------------------------------------------- 履歴ビュー
+
+async function renderHistory(main) {
+  main.innerHTML = `<h2>操作履歴</h2><div class="panel scroll" id="h-out">読み込み中…</div>`;
+  try {
+    const rows = await api("/api/history?limit=200");
+    $("#h-out").innerHTML = `<table>
+      <tr><th>日時 (UTC)</th><th>操作</th><th>結果</th><th>内容</th></tr>
+      ${rows.map(r => `<tr>
+        <td class="mono">${esc(r.created_at)}</td>
+        <td><span class="badge mode">${esc(r.kind)}</span></td>
+        <td>${r.ok ? '<span class="badge ok">OK</span>' : '<span class="badge err">失敗</span>'}</td>
+        <td style="overflow-wrap:anywhere">${esc(r.message)}</td>
+      </tr>`).join("") || `<tr><td colspan="4" class="muted">履歴はまだありません。</td></tr>`}
+    </table>`;
+  } catch (e) { $("#h-out").innerHTML = ""; toast(e.message, "err"); }
+}
+
+show("browse");
+</script>
+</body>
+</html>
