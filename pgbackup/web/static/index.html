@@ -154,34 +154,60 @@ function sizeFmt(n) {
   }
 }
 
+// 二重送信ガード: 処理中はボタンを無効化する
+async function withDisabled(btn, fn) {
+  if (btn.disabled) return;
+  btn.disabled = true;
+  try { return await fn(); } finally { btn.disabled = false; }
+}
+
 // ---------------------------------------------------------------- ジョブ表示
 
 const watchedJobs = new Map();
 async function watchJob(jobId, onDone) {
-  watchedJobs.set(jobId, { onDone });
+  watchedJobs.set(jobId, { onDone, fails: 0 });
   renderJobs();
   const timer = setInterval(async () => {
+    const w = watchedJobs.get(jobId);
+    if (!w) { clearInterval(timer); return; }  // ユーザーが × で閉じた
     try {
       const job = await api("/api/jobs/" + jobId);
-      const w = watchedJobs.get(jobId);
       w.job = job;
+      w.fails = 0;
       renderJobs();
       if (job.status !== "running") {
         clearInterval(timer);
         if (job.status === "done") { toast(job.title + " — 完了"); if (onDone) onDone(job); }
         else toast(job.title + " — 失敗:\n" + (job.error || ""), "err");
       }
-    } catch (e) { clearInterval(timer); }
+    } catch (e) {
+      // 一時的な通信断で追跡を止めない (5 回連続で失敗したら諦めて通知)
+      w.fails++;
+      if (w.fails >= 5) {
+        clearInterval(timer);
+        toast("ジョブ状態の取得に失敗しました (履歴タブで結果を確認してください): " + e.message, "err");
+      }
+    }
   }, 1000);
 }
 
 function renderJobs() {
   const panel = $("#jobs-panel");
+  // 再描画でログのスクロール位置が飛ばないよう保存する
+  const scrolls = new Map();
+  $$(".job", panel).forEach(el => {
+    const log = $(".log", el);
+    if (log) scrolls.set(el.dataset.jobid, {
+      top: log.scrollTop,
+      atBottom: log.scrollTop + log.clientHeight >= log.scrollHeight - 4,
+    });
+  });
   panel.innerHTML = "";
   for (const [id, w] of watchedJobs) {
     const job = w.job || { title: "開始中…", status: "running", log: [] };
     const div = document.createElement("div");
     div.className = "job";
+    div.dataset.jobid = id;
     const badge = job.status === "running" ? '<span class="badge run">実行中</span>'
       : job.status === "done" ? '<span class="badge ok">完了</span>'
       : '<span class="badge err">失敗</span>';
@@ -193,6 +219,9 @@ function renderJobs() {
       <div class="log mono">${(job.log || []).map(l => esc(l)).join("<br>")}</div>`;
     div.querySelector("[data-close]").onclick = () => { watchedJobs.delete(id); renderJobs(); };
     panel.appendChild(div);
+    const log = $(".log", div);
+    const prev = scrolls.get(id);
+    if (log) log.scrollTop = (!prev || prev.atBottom) ? log.scrollHeight : prev.top;
   }
 }
 
@@ -213,7 +242,12 @@ function profileOptions(selected) {
 async function show(view) {
   state.view = view;
   $$("#nav button").forEach(b => b.classList.toggle("active", b.dataset.view === view));
-  await loadProfiles();
+  try {
+    await loadProfiles();
+  } catch (e) {
+    state.profiles = [];
+    toast("プロファイル一覧の取得に失敗しました: " + e.message, "err");
+  }
   const main = $("#main");
   if (view === "conn") renderConn(main);
   else if (view === "browse") renderBrowse(main);
@@ -250,8 +284,7 @@ function renderConn(main) {
         <span class="muted">パスワードはローカルの connections.json に保存されます。</span></div>
     </div>`;
   const tbl = $("#conn-table");
-  tbl.innerHTML = `<tr><th>名前</th><th>接続先</th><th>ユーザー</th><th></th></tr>` +
-    state.profiles.map(p => `<tr>
+  const rowsHtml = state.profiles.map(p => `<tr>
       <td><b>${esc(p.name)}</b></td>
       <td class="mono">${esc(p.host)}:${p.port}</td>
       <td>${esc(p.user)}</td>
@@ -259,7 +292,8 @@ function renderConn(main) {
         <button class="small secondary" data-test="${esc(p.name)}">接続テスト</button>
         <button class="small danger" data-del="${esc(p.name)}">削除</button>
       </td></tr>`).join("") ||
-    `<tr><td class="muted">プロファイルがありません。下のフォームから追加してください。</td></tr>`;
+    `<tr><td colspan="4" class="muted">プロファイルがありません。下のフォームから追加してください。</td></tr>`;
+  tbl.innerHTML = `<tr><th>名前</th><th>接続先</th><th>ユーザー</th><th></th></tr>` + rowsHtml;
   $$("[data-test]", tbl).forEach(b => b.onclick = async () => {
     b.disabled = true;
     try {
@@ -273,7 +307,7 @@ function renderConn(main) {
     try { await api(`/api/profiles/${enc(b.dataset.del)}`, { method: "DELETE" });
       toast("削除しました"); show("conn"); } catch (e) { toast(e.message, "err"); }
   });
-  $("#c-add").onclick = async () => {
+  $("#c-add").onclick = e => withDisabled(e.target, async () => {
     try {
       await api("/api/profiles", { body: {
         name: $("#c-name").value.trim(), host: $("#c-host").value.trim(),
@@ -282,8 +316,8 @@ function renderConn(main) {
         sslmode: $("#c-ssl").value || null, overwrite: $("#c-overwrite").checked,
       }});
       toast("プロファイルを追加しました"); show("conn");
-    } catch (e) { toast(e.message, "err"); }
-  };
+    } catch (e2) { toast(e2.message, "err"); }
+  });
 }
 
 // ---------------------------------------------------------------- DB ブラウズビュー
@@ -312,7 +346,7 @@ function renderBrowse(main) {
     const target = $("#b-dbs");
     target.innerHTML = `<div class="panel muted">読み込み中…</div>`;
     try {
-      const dbs = await api(`/api/profiles/${enc(st.profile)}/databases`);
+      const dbs = await api(`/api/databases?profile=${enc(st.profile)}`);
       target.innerHTML = `<div class="panel"><div class="scroll"><table>
         <tr><th>データベース</th><th>所有者</th><th>エンコーディング</th><th>サイズ</th><th></th></tr>
         ${dbs.map(d => `<tr>
@@ -330,7 +364,7 @@ function renderBrowse(main) {
     const target = $("#b-structure");
     target.innerHTML = `<div class="panel muted">構造を読み込み中…</div>`;
     try {
-      const s = await api(`/api/profiles/${enc(st.profile)}/databases/${enc(db)}/structure`);
+      const s = await api(`/api/structure?profile=${enc(st.profile)}&db=${enc(db)}`);
       const nTables = s.schemas.reduce((a, sc) => a + sc.tables.length, 0);
       target.innerHTML = `
         <h2 style="margin-top:20px">構造: <span class="mono">${esc(db)}</span></h2>
@@ -371,9 +405,9 @@ function renderBrowse(main) {
   async function loadTable(schema, table) {
     const target = $("#b-table-detail");
     target.innerHTML = `<div class="panel muted">読み込み中…</div>`;
-    const base = `/api/profiles/${enc(st.profile)}/databases/${enc(st.db)}/tables/${enc(schema)}/${enc(table)}`;
+    const q = `profile=${enc(st.profile)}&db=${enc(st.db)}&schema=${enc(schema)}&table=${enc(table)}`;
     try {
-      const d = await api(base);
+      const d = await api(`/api/table?${q}`);
       target.innerHTML = `<div class="panel">
         <h3 style="margin-top:0">▤ ${esc(schema)}.${esc(table)}</h3>
         <div class="scroll"><table>
@@ -398,8 +432,11 @@ function renderBrowse(main) {
         const out = $("#b-sample-out");
         out.innerHTML = `<div class="muted">読み込み中…</div>`;
         try {
-          const s = await api(base + "/sample?limit=" + $("#b-sample-n").value);
-          out.innerHTML = `<div class="muted" style="margin:6px 0">総行数: ${Number(s.total_rows).toLocaleString()}</div>
+          const s = await api(`/api/sample?${q}&limit=` + $("#b-sample-n").value);
+          const totalLabel = s.approx
+            ? `約 ${Number(s.total_rows).toLocaleString()} (推定)`
+            : Number(s.total_rows).toLocaleString();
+          out.innerHTML = `<div class="muted" style="margin:6px 0">総行数: ${totalLabel}</div>
             <div class="scroll"><table>
             <tr>${s.columns.map(c => `<th>${esc(c)}</th>`).join("")}</tr>
             ${s.rows.map(r => `<tr>${r.map(v => `<td>${v === null ? '<span class="muted">NULL</span>' : esc(v)}</td>`).join("")}</tr>`).join("")
@@ -476,7 +513,7 @@ function renderBackup(main) {
     const out = $("#k-dblist");
     out.innerHTML = "読み込み中…";
     try {
-      const dbs = await api(`/api/profiles/${enc(st.profile)}/databases`);
+      const dbs = await api(`/api/databases?profile=${enc(st.profile)}`);
       out.className = "";
       out.innerHTML = `
         <label style="margin:8px 0"><input type="checkbox" id="k-all">
@@ -490,29 +527,37 @@ function renderBackup(main) {
     } catch (e) { out.innerHTML = ""; toast(e.message, "err"); }
   }
   $("#k-load").onclick = loadDbs;
+  // プロファイルを切り替えたら古い DB リストを使い回さない
+  $("#k-profile").onchange = loadDbs;
   if (st.profile && state.profiles.some(p => p.name === st.profile)) loadDbs();
 
-  $("#k-run").onclick = async () => {
+  $("#k-run").onclick = e => withDisabled(e.target, async () => {
+    if (!st.profile || st.profile !== $("#k-profile").value || !$("#k-checks")) {
+      toast("先に「DB 一覧を読み込む」を実行してください", "err");
+      return;
+    }
     const mode = $("input[name=k-mode]:checked").value;
     const all = $("#k-all") && $("#k-all").checked;
     const dbs = all ? [] : $$("#k-checks input:checked").map(c => c.value);
     if (!all && !dbs.length) { toast("対象 DB を選択してください", "err"); return; }
     const body = {
-      profile: $("#k-profile").value, dbs, all, mode,
-      fmt: $("#k-fmt").value, note: $("#k-note").value || null,
+      profile: st.profile, dbs, all, mode,
+      note: $("#k-note").value || null,
       archive_db: $("#k-arch-db").value.trim() || "BACK_UP_DB",
-      drop: $("#k-drop").checked, keep_owner: $("#k-keep-owner").checked,
     };
+    if (mode === "file") body.fmt = $("#k-fmt").value;
     if (mode === "archive") body.dest = $("#k-arch-dest").value || null;
     if (mode === "clone") {
       body.dest = $("#k-clone-dest").value;
       body.dest_db = $("#k-clone-db").value.trim() || null;
+      body.drop = $("#k-drop").checked;
+      body.keep_owner = $("#k-keep-owner").checked;
     }
     try {
       const r = await api("/api/backup", { body });
       watchJob(r.job_id, () => { if (state.view === "versions") show("versions"); });
-    } catch (e) { toast(e.message, "err"); }
-  };
+    } catch (e2) { toast(e2.message, "err"); }
+  });
 }
 
 // ---------------------------------------------------------------- バージョンビュー
@@ -578,7 +623,7 @@ function renderVersions(main) {
     const archDb = $("#v-arch-db").value.trim() || "BACK_UP_DB";
     out.innerHTML = "読み込み中…";
     try {
-      const rows = await api(`/api/archive/${enc(profile)}?archive_db=${enc(archDb)}`);
+      const rows = await api(`/api/archive?profile=${enc(profile)}&archive_db=${enc(archDb)}`);
       out.innerHTML = `<table style="margin-top:8px">
         <tr><th>バージョン</th><th>元 DB</th><th>サイズ</th><th>作成日時</th><th>メモ</th><th></th></tr>
         ${rows.map(r => `<tr>
@@ -595,7 +640,7 @@ function renderVersions(main) {
     } catch (e) { out.innerHTML = ""; toast(e.message, "err"); }
   }
 
-  $("#v-file-go").onclick = async () => {
+  $("#v-file-go").onclick = e => withDisabled(e.target, async () => {
     const path = $("#v-file-path").value.trim();
     const db = $("#v-file-db").value.trim();
     if (!path || !db) { toast("ファイルパスと復元先 DB 名を入力してください", "err"); return; }
@@ -603,8 +648,8 @@ function renderVersions(main) {
       const r = await api("/api/restore-file", { body: {
         path, dest: $("#v-file-dest").value, db, drop: $("#v-file-drop").checked } });
       watchJob(r.job_id, () => loadVersionList());
-    } catch (e) { toast(e.message, "err"); }
-  };
+    } catch (e2) { toast(e2.message, "err"); }
+  });
 }
 
 function openRestoreDialog(versionId, defaultDb, submitFn) {
@@ -614,7 +659,7 @@ function openRestoreDialog(versionId, defaultDb, submitFn) {
   $("#dlg-restore-db").value = "";
   $("#dlg-restore-db").placeholder = defaultDb || "(元と同名)";
   $("#dlg-restore-drop").checked = false;
-  $("#dlg-restore-go").onclick = async () => {
+  $("#dlg-restore-go").onclick = e => withDisabled(e.target, async () => {
     try {
       const r = await submitFn({
         dest: $("#dlg-restore-dest").value,
@@ -623,8 +668,8 @@ function openRestoreDialog(versionId, defaultDb, submitFn) {
       });
       dlg.close();
       watchJob(r.job_id);
-    } catch (e) { toast(e.message, "err"); }
-  };
+    } catch (e2) { toast(e2.message, "err"); }
+  });
   dlg.showModal();
 }
 

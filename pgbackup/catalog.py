@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS backups (
     sha256 TEXT,
     pg_dump_version TEXT,
     note TEXT,
+    status TEXT NOT NULL DEFAULT 'done',  -- 'pending' | 'done'
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_backups_profile_db ON backups(profile, db);
@@ -57,6 +58,10 @@ class Catalog:
         self.path = path or catalog_path()
         with self._conn() as conn:
             conn.executescript(_SCHEMA)
+            # 旧スキーマからの移行: status 列がなければ追加する
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(backups)").fetchall()}
+            if "status" not in cols:
+                conn.execute("ALTER TABLE backups ADD COLUMN status TEXT NOT NULL DEFAULT 'done'")
 
     @contextmanager
     def _conn(self):
@@ -68,50 +73,55 @@ class Catalog:
 
     # ---- バージョン ----
 
-    def next_version_no(self, profile: str, db: str, at_least: int = 1) -> int:
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT COALESCE(MAX(version_no), 0) + 1 FROM backups WHERE profile = ? AND db = ?",
-                (profile, db),
-            ).fetchone()
-            return max(row[0], at_least)
-
-    def add_backup(
-        self,
-        *,
-        profile: str,
-        db: str,
-        version_no: int,
-        mode: str,
-        fmt: str,
-        location: str | None = None,
-        archive_profile: str | None = None,
-        archive_db: str | None = None,
-        archive_row_id: int | None = None,
-        size: int | None = None,
-        sha256: str | None = None,
-        pg_dump_version: str | None = None,
-        note: str | None = None,
+    def reserve_version(
+        self, profile: str, db: str, mode: str, fmt: str, at_least: int = 1
     ) -> dict:
-        version_id = f"{profile}/{db}@v{version_no}"
+        """次のバージョン番号を採番して 'pending' 行を登録する。
+
+        MAX+1 の計算と INSERT を単一文で行うため、並行実行しても番号は衝突しない
+        (SQLite の書き込みロックで直列化される)。バックアップ完了時に
+        finalize_backup、失敗時に abort_backup を呼ぶこと。
+        """
+        with self._conn() as conn:
+            cur = conn.execute(
+                """INSERT INTO backups
+                     (version_id, profile, db, version_no, mode, fmt, status, created_at)
+                   SELECT ?1 || '/' || ?2 || '@v' || vn, ?1, ?2, vn, ?3, ?4, 'pending', ?5
+                   FROM (SELECT MAX(COALESCE(MAX(version_no), 0) + 1, ?6) AS vn
+                         FROM backups WHERE profile = ?1 AND db = ?2)""",
+                (profile, db, mode, fmt, _now(), at_least),
+            )
+            row = conn.execute("SELECT * FROM backups WHERE id = ?", (cur.lastrowid,)).fetchone()
+            return dict(row)
+
+    def finalize_backup(self, backup_id: int, **fields) -> dict:
+        """pending 行にバックアップ結果を書き込み status='done' にする。"""
+        allowed = {
+            "location", "archive_profile", "archive_db", "archive_row_id",
+            "size", "sha256", "pg_dump_version", "note",
+        }
+        bad = set(fields) - allowed
+        if bad:
+            raise ValueError(f"不明なフィールド: {bad}")
+        sets = ", ".join(f"{k} = ?" for k in fields)
         with self._conn() as conn:
             conn.execute(
-                """INSERT INTO backups
-                   (version_id, profile, db, version_no, mode, fmt, location,
-                    archive_profile, archive_db, archive_row_id,
-                    size, sha256, pg_dump_version, note, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    version_id, profile, db, version_no, mode, fmt, location,
-                    archive_profile, archive_db, archive_row_id,
-                    size, sha256, pg_dump_version, note, _now(),
-                ),
+                f"UPDATE backups SET {sets}{', ' if sets else ''}status = 'done' WHERE id = ?",
+                (*fields.values(), backup_id),
             )
-        return self.get_backup(version_id)
+            row = conn.execute("SELECT * FROM backups WHERE id = ?", (backup_id,)).fetchone()
+            return dict(row)
+
+    def abort_backup(self, backup_id: int) -> None:
+        """失敗したバックアップの pending 行を削除する。"""
+        with self._conn() as conn:
+            conn.execute("DELETE FROM backups WHERE id = ? AND status = 'pending'", (backup_id,))
 
     def get_backup(self, version_id: str) -> dict:
         with self._conn() as conn:
-            row = conn.execute("SELECT * FROM backups WHERE version_id = ?", (version_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM backups WHERE version_id = ? AND status = 'done'", (version_id,)
+            ).fetchone()
         if row is None:
             raise PgBackupError(
                 f"バージョン '{version_id}' がカタログに見つかりません。"
@@ -121,15 +131,14 @@ class Catalog:
 
     def list_backups(self, profile: str | None = None, db: str | None = None) -> list[dict]:
         q = "SELECT * FROM backups"
-        cond, args = [], []
+        cond, args = ["status = 'done'"], []
         if profile:
             cond.append("profile = ?")
             args.append(profile)
         if db:
             cond.append("db = ?")
             args.append(db)
-        if cond:
-            q += " WHERE " + " AND ".join(cond)
+        q += " WHERE " + " AND ".join(cond)
         q += " ORDER BY profile, db, version_no"
         with self._conn() as conn:
             return [dict(r) for r in conn.execute(q, args).fetchall()]

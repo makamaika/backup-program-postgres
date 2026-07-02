@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 from .. import archive as archive_mod
 from .. import backup as backup_mod
+from .. import config
 from .. import inspect as inspect_mod
 from .. import restore as restore_mod
 from ..catalog import Catalog
@@ -100,7 +101,7 @@ class BackupIn(BaseModel):
     dbs: list[str] = []
     all: bool = False
     mode: str = "file"  # file | archive | clone
-    fmt: str = "plain"
+    fmt: str | None = None
     dest: str | None = None
     dest_db: str | None = None
     archive_db: str = DEFAULT_ARCHIVE_DB
@@ -142,6 +143,7 @@ def create_app() -> FastAPI:
     store = ProfileStore()
     catalog = Catalog()
     jobs = JobManager()
+    config.cleanup_tmp()
 
     @app.exception_handler(PgBackupError)
     async def _pgbackup_error(request: Request, exc: PgBackupError):
@@ -182,26 +184,27 @@ def create_app() -> FastAPI:
             return {"ok": False, "error": str(e)}
 
     # ---- データベース検査 ----
+    # DB / スキーマ / テーブル名は '/' 等を含み得るためパスではなくクエリで受ける
 
-    @app.get("/api/profiles/{name}/databases")
-    def list_dbs(name: str, templates: bool = False):
-        return inspect_mod.list_databases(store.get(name), include_templates=templates)
+    @app.get("/api/databases")
+    def list_dbs(profile: str, templates: bool = False):
+        return inspect_mod.list_databases(store.get(profile), include_templates=templates)
 
-    @app.get("/api/profiles/{name}/databases/{db}/structure")
-    def db_structure(name: str, db: str):
-        return inspect_mod.database_structure(store.get(name), db)
+    @app.get("/api/structure")
+    def db_structure(profile: str, db: str):
+        return inspect_mod.database_structure(store.get(profile), db)
 
-    @app.get("/api/profiles/{name}/databases/{db}/tables/{schema}/{table}")
-    def table_detail(name: str, db: str, schema: str, table: str):
-        profile = store.get(name)
+    @app.get("/api/table")
+    def table_detail(profile: str, db: str, schema: str, table: str):
+        p = store.get(profile)
         return {
-            "columns": inspect_mod.table_columns(profile, db, schema, table),
-            "indexes": inspect_mod.table_indexes(profile, db, schema, table),
+            "columns": inspect_mod.table_columns(p, db, schema, table),
+            "indexes": inspect_mod.table_indexes(p, db, schema, table),
         }
 
-    @app.get("/api/profiles/{name}/databases/{db}/tables/{schema}/{table}/sample")
-    def table_sample(name: str, db: str, schema: str, table: str, limit: int = 10):
-        return inspect_mod.table_sample(store.get(name), db, schema, table, limit)
+    @app.get("/api/sample")
+    def table_sample(profile: str, db: str, schema: str, table: str, limit: int = 10):
+        return inspect_mod.table_sample(store.get(profile), db, schema, table, limit)
 
     # ---- バックアップ / リストア (ジョブ) ----
 
@@ -211,18 +214,16 @@ def create_app() -> FastAPI:
         dbs = backup_mod.resolve_target_dbs(
             source, body.dbs or None, all_dbs=body.all, archive_db=body.archive_db
         )
+        fmt = backup_mod.check_mode_options(
+            body.mode, fmt=body.fmt, dest=body.dest, dest_db=body.dest_db,
+            drop=body.drop, keep_owner=body.keep_owner, n_dbs=len(dbs),
+        )
         if body.mode == "clone":
-            if not body.dest:
-                raise PgBackupError("clone モードでは複製先プロファイル (dest) が必須です")
-            if body.dest_db and len(dbs) > 1:
-                raise PgBackupError("複製先 DB 名は対象が 1 DB のときのみ指定できます")
             dest = store.get(body.dest)
         elif body.mode == "archive":
             dest = store.get(body.dest) if body.dest else source
-        elif body.mode == "file":
-            dest = None
         else:
-            raise PgBackupError(f"不明なモード: {body.mode}")
+            dest = None
 
         def run(log):
             results = []
@@ -231,14 +232,17 @@ def create_app() -> FastAPI:
                 if body.mode == "clone":
                     r = backup_mod.clone_database(
                         catalog, source, db, dest, body.dest_db or db,
-                        drop=body.drop, keep_owner=body.keep_owner,
+                        drop=body.drop, keep_owner=body.keep_owner, note=body.note,
                     )
                 elif body.mode == "archive":
                     r = backup_mod.backup_to_archive(
                         catalog, source, db, dest, archive_db=body.archive_db, note=body.note
                     )
                 else:
-                    r = backup_mod.backup_to_file(catalog, source, db, fmt=body.fmt, note=body.note)
+                    r = backup_mod.backup_to_file(
+                        catalog, source, db, fmt=fmt, note=body.note,
+                        keep_owner=body.keep_owner,
+                    )
                 results.append(r)
                 log(f"{db} 完了")
             return results
@@ -296,9 +300,9 @@ def create_app() -> FastAPI:
     def versions(profile: str | None = None, db: str | None = None):
         return catalog.list_backups(profile=profile, db=db)
 
-    @app.get("/api/archive/{name}")
-    def archive_list(name: str, archive_db: str = DEFAULT_ARCHIVE_DB):
-        return archive_mod.list_archive(store.get(name), archive_db)
+    @app.get("/api/archive")
+    def archive_list(profile: str, archive_db: str = DEFAULT_ARCHIVE_DB):
+        return archive_mod.list_archive(store.get(profile), archive_db)
 
     @app.get("/api/history")
     def history(limit: int = 100):

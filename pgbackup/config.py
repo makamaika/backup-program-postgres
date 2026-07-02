@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import threading
+import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -17,6 +20,9 @@ from .errors import ProfileError
 
 # アーカイブモードの既定の格納先データベース名
 DEFAULT_ARCHIVE_DB = "BACK_UP_DB"
+
+# プロファイル名: パス・URL・バージョン ID ("profile/db@vN") に安全に埋め込める文字のみ
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
 
 
 def home_dir() -> Path:
@@ -36,6 +42,21 @@ def tmp_dir() -> Path:
     d = home_dir() / "tmp"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def cleanup_tmp(max_age_hours: float = 24) -> None:
+    """異常終了で残った一時ファイルを掃除する (CLI / Web の起動時に呼ぶ)。"""
+    cutoff = time.time() - max_age_hours * 3600
+    try:
+        entries = list(tmp_dir().iterdir())
+    except OSError:
+        return
+    for p in entries:
+        try:
+            if p.is_file() and p.stat().st_mtime < cutoff:
+                p.unlink()
+        except OSError:
+            pass  # 使用中・権限なし等は無視
 
 
 def catalog_path() -> Path:
@@ -69,7 +90,13 @@ class Profile:
 
 
 class ProfileStore:
-    """connections.json の読み書き。"""
+    """connections.json の読み書き。
+
+    同一プロセス内 (Web の並行リクエスト等) の読み書きはロックで直列化する。
+    別プロセス同時書き込みの保護はない (最後の書き込みが勝つ)。
+    """
+
+    _lock = threading.Lock()
 
     def __init__(self, path: Path | None = None):
         self.path = path or (home_dir() / "connections.json")
@@ -85,7 +112,15 @@ class ProfileStore:
         tmp = self.path.with_suffix(".json.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.path)
+        # Windows では対象を開いているプロセスがいると os.replace が一時的に失敗する
+        for attempt in range(5):
+            try:
+                os.replace(tmp, self.path)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.1 * (attempt + 1))
 
     def list(self) -> list[Profile]:
         raw = self._load_raw()
@@ -100,17 +135,24 @@ class ProfileStore:
         return Profile(name=name, **attrs)
 
     def add(self, profile: Profile, overwrite: bool = False) -> None:
-        raw = self._load_raw()
-        if profile.name in raw["profiles"] and not overwrite:
-            raise ProfileError(f"接続プロファイル '{profile.name}' は既に存在します (--overwrite で上書き)")
-        attrs = asdict(profile)
-        attrs.pop("name")
-        raw["profiles"][profile.name] = attrs
-        self._save_raw(raw)
+        if not _PROFILE_NAME_RE.match(profile.name):
+            raise ProfileError(
+                f"プロファイル名 '{profile.name}' は使用できません。"
+                "英数字・アンダースコアで始まり、英数字・「_ . -」のみ 64 文字以内で指定してください。"
+            )
+        with self._lock:
+            raw = self._load_raw()
+            if profile.name in raw["profiles"] and not overwrite:
+                raise ProfileError(f"接続プロファイル '{profile.name}' は既に存在します (--overwrite で上書き)")
+            attrs = asdict(profile)
+            attrs.pop("name")
+            raw["profiles"][profile.name] = attrs
+            self._save_raw(raw)
 
     def remove(self, name: str) -> None:
-        raw = self._load_raw()
-        if name not in raw["profiles"]:
-            raise ProfileError(f"接続プロファイル '{name}' が見つかりません")
-        del raw["profiles"][name]
-        self._save_raw(raw)
+        with self._lock:
+            raw = self._load_raw()
+            if name not in raw["profiles"]:
+                raise ProfileError(f"接続プロファイル '{name}' が見つかりません")
+            del raw["profiles"][name]
+            self._save_raw(raw)

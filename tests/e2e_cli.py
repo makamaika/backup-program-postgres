@@ -12,6 +12,7 @@ PGBACKUP_HOME を一時ディレクトリに向けて実行すること。
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -85,7 +86,9 @@ def main() -> int:
     assert home, "PGBACKUP_HOME を一時ディレクトリに設定してから実行してください"
     print(f"PGBACKUP_HOME = {home}")
 
-    # 再実行に備えたクリーンアップ
+    # 再実行に備えたクリーンアップ (バージョン番号を決定的にするためカタログも消す)
+    (Path(home) / "catalog.db").unlink(missing_ok=True)
+    shutil.rmtree(Path(home) / "backups", ignore_errors=True)
     for port, dbs in (
         (PORT_A, ["shop_db_copy", "shop_db_arch1", "shop_db_arch2", "shop_db_file",
                   "analytics_db", "BACK_UP_DB", "inventory_web_restore"]),
@@ -263,6 +266,16 @@ def main() -> int:
         out = run("history", "--limit", "100")
         assert "backup" in out and "restore" in out and "clone" in out and "OK" in out
 
+    # ---- アーカイブ削除とカタログ同期 ----
+
+    @check("archive delete: アーカイブとローカルカタログの両方から消える")
+    def _():
+        out = run("archive", "delete", "local", "local/shop_db@v3")
+        assert "カタログからも削除" in out
+        assert "@v3" not in run("versions", "--profile", "local", "--db", "shop_db")
+        rows = q(PORT_A, "BACK_UP_DB", "SELECT version_id FROM pgbackup_archive")
+        assert ("local/shop_db@v3",) not in rows
+
     # ---- 異常系 ----
 
     @check("異常系: 複製元と複製先が同一ならエラー")
@@ -270,6 +283,16 @@ def main() -> int:
         out = run("backup", "local", "--db", "shop_db", "--mode", "clone",
                   "--dest", "local", expect_fail=True)
         assert "複製元と複製先が同一" in out
+
+    @check("異常系: ホスト表記ゆれ (localhost vs 127.0.0.1) でも同一クラスタを検出")
+    def _():
+        run("conn", "add", "local_alias", "--host", "127.0.0.1", "--port", str(PORT_A),
+            "--user", USER, "--overwrite")
+        out = run("backup", "local", "--db", "shop_db", "--mode", "clone",
+                  "--dest", "local_alias", "--drop", expect_fail=True)
+        assert "複製元と複製先が同一" in out
+        # 複製元が無事なことを確認
+        assert shop_counts(PORT_A, "shop_db") == (500, 2000)
 
     @check("異常系: 既存 DB へ --drop なしでリストアするとエラー")
     def _():
@@ -287,6 +310,34 @@ def main() -> int:
     def _():
         out = run("restore", "local/shop_db@v999", "--dest", "local", expect_fail=True)
         assert "見つかりません" in out
+
+    @check("異常系: --out ファイル指定 + 複数 DB はエラー")
+    def _():
+        out = run("backup", "local", "--db", "shop_db", "--db", "inventory_db",
+                  "--mode", "file", "--out", str(Path(home) / "multi.sql"),
+                  expect_fail=True)
+        assert "1 つだけ" in out
+
+    @check("異常系: 既存ファイルへの --out 上書きはエラー")
+    def _():
+        target = Path(home) / "dup_out.sql"
+        run("backup", "local", "--db", "inventory_db", "--mode", "file",
+            "--out", str(target))
+        out = run("backup", "local", "--db", "inventory_db", "--mode", "file",
+                  "--out", str(target), expect_fail=True)
+        assert "既に存在" in out
+
+    @check("異常系: モードに無関係なフラグはエラー (--drop + archive)")
+    def _():
+        out = run("backup", "local", "--db", "shop_db", "--mode", "archive",
+                  "--drop", expect_fail=True)
+        assert "clone モード専用" in out
+
+    @check("異常系: 不正なプロファイル名は登録できない")
+    def _():
+        out = run("conn", "add", "bad/name", "--host", "localhost",
+                  "--port", str(PORT_A), expect_fail=True)
+        assert "使用できません" in out
 
     print(f"\n結果: {passed} passed, {failed} failed")
     return 1 if failed else 0

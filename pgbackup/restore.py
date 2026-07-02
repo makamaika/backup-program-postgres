@@ -15,7 +15,7 @@ from . import pgtools
 from .backup import sha256_of_file
 from .catalog import Catalog
 from .config import Profile, ProfileStore, tmp_dir
-from .db import ensure_database
+from .db import replace_database
 from .errors import RestoreError
 
 
@@ -65,15 +65,22 @@ def restore_version(
         elif rec["mode"] == "archive":
             src_profile = profiles.get(rec["archive_profile"])
             fetched_tmp = tmp_dir() / f"restore_{uuid.uuid4().hex}.dump"
-            archive_mod.fetch_dump(
-                src_profile, rec["archive_db"], fetched_tmp, version_id=version_id
+            # 行 id で特定する (行が削除→同じ version_id で再作成されていても別物を掴まない)
+            meta = archive_mod.fetch_dump(
+                src_profile, rec["archive_db"], fetched_tmp,
+                version_id=version_id, row_id=rec.get("archive_row_id"),
             )
+            if rec.get("sha256") and meta.get("sha256") != rec["sha256"]:
+                raise RestoreError(
+                    f"アーカイブ '{version_id}' の内容がカタログの記録と一致しません "
+                    "(sha256 不一致)。アーカイブが差し替えられた可能性があります。"
+                )
             dump_path = fetched_tmp
         else:
             raise RestoreError(f"復元できないモードです: {rec['mode']}")
 
-        ensure_database(dest, dest_db, drop=drop)
-        _restore_dump(dest, dest_db, dump_path, rec["fmt"], keep_owner=keep_owner)
+        with replace_database(dest, dest_db, drop=drop):
+            _restore_dump(dest, dest_db, dump_path, rec["fmt"], keep_owner=keep_owner)
     except Exception as e:
         catalog.log_operation("restore", False, f"リストア失敗: {version_id} -> {detail['dest']}: {e}", detail)
         raise
@@ -100,8 +107,8 @@ def restore_dump_file(
     fmt = _detect_format(path)
     detail = {"file": str(path), "fmt": fmt, "dest": f"{dest.name}:{dest_db}", "drop": drop}
     try:
-        ensure_database(dest, dest_db, drop=drop)
-        _restore_dump(dest, dest_db, path, fmt, keep_owner=keep_owner)
+        with replace_database(dest, dest_db, drop=drop):
+            _restore_dump(dest, dest_db, path, fmt, keep_owner=keep_owner)
     except Exception as e:
         catalog.log_operation("restore", False, f"ファイルからのリストア失敗: {path} -> {detail['dest']}: {e}", detail)
         raise
@@ -130,8 +137,8 @@ def restore_from_archive(
         meta = archive_mod.fetch_dump(archive_host, archive_db, fetched, version_id=version_id)
         dest_db = dest_db or meta["source_db"]
         detail["dest"] = f"{dest.name}:{dest_db}"
-        ensure_database(dest, dest_db, drop=drop)
-        _restore_dump(dest, dest_db, fetched, meta["fmt"], keep_owner=keep_owner)
+        with replace_database(dest, dest_db, drop=drop):
+            _restore_dump(dest, dest_db, fetched, meta["fmt"], keep_owner=keep_owner)
     except Exception as e:
         catalog.log_operation("restore", False, f"アーカイブからのリストア失敗: {version_id}: {e}", detail)
         raise

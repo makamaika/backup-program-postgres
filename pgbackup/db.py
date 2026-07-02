@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import uuid
+from contextlib import contextmanager
+
 import psycopg
 from psycopg import sql
 
@@ -79,13 +82,83 @@ def drop_database(profile: Profile, dbname: str) -> None:
         conn.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(dbname)))
 
 
-def ensure_database(profile: Profile, dbname: str, drop: bool = False, encoding: str | None = None) -> None:
-    """リストア/複製先の DB を用意する。既存なら drop=True のときのみ作り直す。"""
+def rename_database(profile: Profile, old: str, new: str) -> None:
+    """接続を強制切断してから ALTER DATABASE ... RENAME TO。"""
+    with connect(profile, autocommit=True) as conn:
+        conn.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = %s AND pid <> pg_backend_pid()",
+            (old,),
+        )
+        conn.execute(
+            sql.SQL("ALTER DATABASE {} RENAME TO {}").format(
+                sql.Identifier(old), sql.Identifier(new)
+            )
+        )
+
+
+def _trash_name(dbname: str) -> str:
+    """退避用の一時 DB 名 (識別子の 63 バイト制限内に収める)。"""
+    suffix = f"_pgb_old_{uuid.uuid4().hex[:8]}"
+    base = dbname
+    while len((base + suffix).encode("utf-8")) > 63:
+        base = base[:-1]
+    return base + suffix
+
+
+def cluster_identity(profile: Profile) -> str:
+    """クラスタの一意識別子。ホスト名の表記ゆれ (localhost / 127.0.0.1 等) に
+    影響されない同一サーバー判定に使う。取得できない場合は host:port にフォールバック。"""
+    try:
+        with connect(profile) as conn:
+            row = conn.execute("SELECT system_identifier FROM pg_control_system()").fetchone()
+            return f"pg:{row[0]}:{profile.port}"
+    except psycopg.Error:
+        return f"addr:{profile.host.lower()}:{profile.port}"
+
+
+def same_cluster(a: Profile, b: Profile) -> bool:
+    if a.host == b.host and a.port == b.port:
+        return True
+    return cluster_identity(a) == cluster_identity(b)
+
+
+@contextmanager
+def replace_database(profile: Profile, dbname: str, drop: bool = False,
+                     encoding: str | None = None):
+    """リストア/複製先の DB を安全に用意するコンテキストマネージャ。
+
+    既存 DB は削除せず一時名に退避してから新 DB を作る。
+    with ブロックが失敗したら新 DB を消して退避 DB を元に戻し、
+    成功したら退避 DB を削除する。途中失敗で「空の DB だけが残る」事故を防ぐ。
+    """
+    trash: str | None = None
     if database_exists(profile, dbname):
         if not drop:
             raise PgBackupError(
                 f"データベース '{dbname}' は {profile.display()} に既に存在します。"
                 "上書きするには --drop を指定してください。"
             )
-        drop_database(profile, dbname)
-    create_database(profile, dbname, encoding=encoding)
+        trash = _trash_name(dbname)
+        rename_database(profile, dbname, trash)
+    try:
+        create_database(profile, dbname, encoding=encoding)
+        yield
+    except BaseException:
+        # 失敗: 作りかけの DB を消し、退避していた元 DB を戻す
+        try:
+            drop_database(profile, dbname)
+        except psycopg.Error:
+            pass
+        if trash is not None:
+            try:
+                rename_database(profile, trash, dbname)
+            except psycopg.Error:
+                pass
+        raise
+    else:
+        if trash is not None:
+            try:
+                drop_database(profile, trash)
+            except psycopg.Error:
+                pass

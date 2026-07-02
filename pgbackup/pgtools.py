@@ -11,6 +11,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from psycopg import conninfo as _pg_conninfo
+
 from .config import Profile
 from .errors import ToolError
 
@@ -74,8 +76,18 @@ def _env_for(profile: Profile) -> dict:
     return env
 
 
-def _conn_args(profile: Profile) -> list[str]:
-    return ["-h", profile.host, "-p", str(profile.port), "-U", profile.user, "--no-password"]
+def _conninfo(profile: Profile, dbname: str) -> str:
+    """接続文字列を組み立てる。
+
+    DB 名を pg_dump/psql の位置引数や -d に生で渡すと、'=' を含む名前や
+    postgresql:// で始まる名前が conninfo として、'-' で始まる名前がオプションとして
+    誤解釈される。make_conninfo で常に完全な conninfo を組み立てて防ぐ。
+    パスワードはプロセス一覧に出さないため conninfo に含めず PGPASSWORD 環境変数で渡す。
+    """
+    kwargs: dict = dict(host=profile.host, port=profile.port, user=profile.user, dbname=dbname)
+    if profile.sslmode:
+        kwargs["sslmode"] = profile.sslmode
+    return _pg_conninfo.make_conninfo(**kwargs)
 
 
 def _run(cmd: list[str], env: dict) -> None:
@@ -91,24 +103,38 @@ def pg_dump_version() -> str:
     return proc.stdout.strip()
 
 
-def dump_to_file(profile: Profile, dbname: str, out_path: Path, fmt: str = "plain") -> None:
-    """pg_dump でファイルへ出力する。fmt: 'plain' (SQL) または 'custom' (.dump)。"""
+def dump_to_file(
+    profile: Profile, dbname: str, out_path: Path, fmt: str = "plain", keep_owner: bool = True
+) -> None:
+    """pg_dump でファイルへ出力する。fmt: 'plain' (SQL) または 'custom' (.dump)。
+
+    plain 形式は psql でそのまま流し込むため、keep_owner=False なら
+    ダンプ時点で所有者/権限文を除いて移植可能にする
+    (custom 形式は pg_restore 側の --no-owner で制御するため常に含めてよい)。
+    """
     fmt_flag = "p" if fmt == "plain" else "c"
     cmd = [
         tool_path("pg_dump"),
-        *_conn_args(profile),
+        "--no-password",
+        f"--dbname={_conninfo(profile, dbname)}",
         f"--format={fmt_flag}",
         "--file",
         str(out_path),
-        dbname,
     ]
+    if fmt == "plain" and not keep_owner:
+        cmd += ["--no-owner", "--no-privileges"]
     out_path.parent.mkdir(parents=True, exist_ok=True)
     _run(cmd, _env_for(profile))
 
 
 def restore_custom(profile: Profile, dbname: str, dump_path: Path, keep_owner: bool = False) -> None:
     """カスタム形式 (.dump) を pg_restore で dbname に復元する。"""
-    cmd = [tool_path("pg_restore"), *_conn_args(profile), "-d", dbname]
+    cmd = [
+        tool_path("pg_restore"),
+        "--no-password",
+        "-d",
+        _conninfo(profile, dbname),
+    ]
     if not keep_owner:
         cmd += ["--no-owner", "--no-privileges"]
     cmd.append(str(dump_path))
@@ -116,15 +142,20 @@ def restore_custom(profile: Profile, dbname: str, dump_path: Path, keep_owner: b
 
 
 def restore_plain(profile: Profile, dbname: str, sql_path: Path) -> None:
-    """プレーン SQL ダンプを psql で dbname に流し込む。"""
+    """プレーン SQL ダンプを psql で dbname に流し込む。
+
+    注意: psql はダンプ内のメタコマンド (\\! 等) も実行する。
+    信頼できるファイルのみ復元すること (README のセキュリティ注意を参照)。
+    """
     cmd = [
         tool_path("psql"),
-        *_conn_args(profile),
+        "--no-password",
+        "--no-psqlrc",
         "-v",
         "ON_ERROR_STOP=1",
         "--quiet",
         "-d",
-        dbname,
+        _conninfo(profile, dbname),
         "-f",
         str(sql_path),
     ]
@@ -135,8 +166,14 @@ def pipe_dump_restore(
     src: Profile, src_db: str, dest: Profile, dest_db: str, keep_owner: bool = False
 ) -> None:
     """pg_dump -Fc | pg_restore で DB を直接複製する (中間ファイルなし)。"""
-    dump_cmd = [tool_path("pg_dump"), *_conn_args(src), "--format=c", src_db]
-    restore_cmd = [tool_path("pg_restore"), *_conn_args(dest), "-d", dest_db]
+    dump_cmd = [
+        tool_path("pg_dump"), "--no-password",
+        f"--dbname={_conninfo(src, src_db)}", "--format=c",
+    ]
+    restore_cmd = [
+        tool_path("pg_restore"), "--no-password",
+        "-d", _conninfo(dest, dest_db),
+    ]
     if not keep_owner:
         restore_cmd += ["--no-owner", "--no-privileges"]
 
@@ -153,7 +190,12 @@ def pipe_dump_restore(
             f.seek(0)
             return f.read().strip()[-_STDERR_TAIL:]
 
-        if rc_dump != 0:
-            raise ToolError(f"pg_dump が失敗しました (exit={rc_dump}):\n{_tail(err1)}")
-        if rc_restore != 0:
-            raise ToolError(f"pg_restore が失敗しました (exit={rc_restore}):\n{_tail(err2)}")
+        # pg_restore 側が先に死ぬと pg_dump はパイプ切断 (EPIPE) で巻き添え終了する。
+        # 根本原因を見せるため両方のエラーをまとめ、pg_restore を先に報告する。
+        if rc_dump != 0 or rc_restore != 0:
+            parts = []
+            if rc_restore != 0:
+                parts.append(f"pg_restore (exit={rc_restore}):\n{_tail(err2)}")
+            if rc_dump != 0:
+                parts.append(f"pg_dump (exit={rc_dump}):\n{_tail(err1)}")
+            raise ToolError("複製に失敗しました:\n" + "\n\n".join(parts))

@@ -110,14 +110,14 @@ def main() -> int:
             r = api("/api/profiles/local/test", body={})
             assert r["ok"] and r["server_version"]
 
-        @check("GET /api/profiles/local/databases")
+        @check("GET /api/databases?profile=local")
         def _():
-            names = {d["name"] for d in api("/api/profiles/local/databases")}
+            names = {d["name"] for d in api("/api/databases?profile=local")}
             assert "shop_db" in names and "inventory_db" in names
 
         @check("GET structure: スキーマ・テーブル・データ型内訳")
         def _():
-            s = api("/api/profiles/local/databases/shop_db/structure")
+            s = api("/api/structure?profile=local&db=shop_db")
             schemas = {sc["name"] for sc in s["schemas"]}
             assert {"public", "sales"} <= schemas
             types = {d["data_type"] for d in s["datatype_summary"]}
@@ -125,7 +125,7 @@ def main() -> int:
 
         @check("GET table detail: カラム・PK・インデックス")
         def _():
-            d = api("/api/profiles/local/databases/shop_db/tables/public/customers")
+            d = api("/api/table?profile=local&db=shop_db&schema=public&table=customers")
             cols = {c["name"]: c for c in d["columns"]}
             assert cols["id"]["is_primary_key"] is True
             assert cols["profile"]["data_type"] == "jsonb"
@@ -133,9 +133,9 @@ def main() -> int:
 
         @check("GET sample: データのサンプルと総行数")
         def _():
-            s = api("/api/profiles/local/databases/shop_db/tables/public/customers/sample?limit=5")
+            s = api("/api/sample?profile=local&db=shop_db&schema=public&table=customers&limit=5")
             assert s["total_rows"] == 500 and len(s["rows"]) == 5
-            assert "name" in s["columns"]
+            assert "name" in s["columns"] and s["approx"] is False
 
         @check("POST /api/backup (file) + ジョブ完了")
         def _():
@@ -163,10 +163,11 @@ def main() -> int:
                                  dbname="inventory_web_restore") as c:
                 assert c.execute("SELECT count(*) FROM items").fetchone()[0] == 100
 
-        @check("GET /api/archive/local にアーカイブが載る")
+        @check("GET /api/archive にアーカイブが載る")
         def _():
-            rows = api("/api/archive/local")
-            assert any(r["version_id"] == "local/shop_db@v3" for r in rows)
+            # CLI テストで remote の BACK_UP_DB に shop_db@v4 を保存済み
+            rows = api("/api/archive?profile=remote")
+            assert any(r["source_db"] == "shop_db" for r in rows)
 
         @check("GET /api/history")
         def _():
@@ -176,7 +177,7 @@ def main() -> int:
         @check("異常系: 存在しないプロファイルは 400")
         def _():
             try:
-                api("/api/profiles/no_such/databases")
+                api("/api/databases?profile=no_such")
                 raise AssertionError("400 を期待したが成功した")
             except urllib.error.HTTPError as e:
                 assert e.code == 400

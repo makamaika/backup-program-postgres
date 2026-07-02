@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import psycopg
 from psycopg import sql
 
 from .config import Profile
@@ -120,15 +121,33 @@ def table_indexes(profile: Profile, dbname: str, schema: str, table: str) -> lis
 def table_sample(
     profile: Profile, dbname: str, schema: str, table: str, limit: int = 10
 ) -> dict:
-    """テーブルの先頭数行と正確な行数を返す (データの中身確認用)。"""
+    """テーブルの先頭数行と行数を返す (データの中身確認用)。
+
+    行数の正確なカウントは巨大テーブルではフルスキャンになるため 5 秒で打ち切り、
+    タイムアウト時は統計情報による推定値 (approx=True) を返す。
+    """
     limit = max(1, min(int(limit), 200))
     with connect(profile, dbname) as conn:
         ident = sql.SQL("{}.{}").format(sql.Identifier(schema), sql.Identifier(table))
         cur = conn.execute(sql.SQL("SELECT * FROM {} LIMIT {}").format(ident, sql.Literal(limit)))
         columns = [c.name for c in cur.description]
         rows = [[_jsonable(v) for v in row] for row in cur.fetchall()]
-        exact = conn.execute(sql.SQL("SELECT count(*) FROM {}").format(ident)).fetchone()[0]
-    return {"columns": columns, "rows": rows, "total_rows": exact}
+        approx = False
+        try:
+            with conn.transaction():
+                conn.execute("SET LOCAL statement_timeout = '5000ms'")
+                total = conn.execute(
+                    sql.SQL("SELECT count(*) FROM {}").format(ident)
+                ).fetchone()[0]
+        except psycopg.errors.QueryCanceled:
+            approx = True
+            total = conn.execute(
+                """SELECT GREATEST(c.reltuples, 0)::bigint
+                   FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                   WHERE n.nspname = %s AND c.relname = %s""",
+                (schema, table),
+            ).fetchone()[0]
+    return {"columns": columns, "rows": rows, "total_rows": total, "approx": approx}
 
 
 def datatype_summary(profile: Profile, dbname: str) -> list[dict]:

@@ -22,6 +22,7 @@ from pathlib import Path
 
 from . import __version__, backup as backup_mod, inspect as inspect_mod, restore as restore_mod
 from . import archive as archive_mod
+from . import config
 from .catalog import Catalog
 from .config import DEFAULT_ARCHIVE_DB, Profile, ProfileStore, home_dir
 from .db import server_version
@@ -125,17 +126,18 @@ def cmd_backup(args, store: ProfileStore, catalog: Catalog) -> int:
     source = store.get(args.profile)
     archive_db = args.archive_db
     dbs = backup_mod.resolve_target_dbs(source, args.db, all_dbs=args.all, archive_db=archive_db)
+    fmt = backup_mod.check_mode_options(
+        args.mode, fmt=args.fmt, out=args.out, dest=args.dest, dest_db=args.dest_db,
+        drop=args.drop, keep_owner=args.keep_owner, n_dbs=len(dbs),
+    )
 
     if args.mode == "clone":
-        if not args.dest:
-            raise PgBackupError("clone モードでは --dest (複製先プロファイル) が必須です")
-        if args.dest_db and len(dbs) > 1:
-            raise PgBackupError("--dest-db は対象 DB が 1 つのときのみ指定できます")
         dest = store.get(args.dest)
         for db in dbs:
             dest_db = args.dest_db or db
             r = backup_mod.clone_database(
-                catalog, source, db, dest, dest_db, drop=args.drop, keep_owner=args.keep_owner
+                catalog, source, db, dest, dest_db,
+                drop=args.drop, keep_owner=args.keep_owner, note=args.note,
             )
             print(f"複製完了: {source.name}:{db} -> {dest.name}:{r['dest_db']}")
     elif args.mode == "archive":
@@ -149,8 +151,9 @@ def cmd_backup(args, store: ProfileStore, catalog: Catalog) -> int:
     else:  # file
         for db in dbs:
             rec = backup_mod.backup_to_file(
-                catalog, source, db, fmt=args.fmt,
+                catalog, source, db, fmt=fmt,
                 out=Path(args.out) if args.out else None, note=args.note,
+                keep_owner=args.keep_owner,
             )
             print(f"バックアップ完了: {rec['version_id']}")
             print(f"  ファイル: {rec['location']} ({_size_fmt(rec['size'])})")
@@ -205,6 +208,16 @@ def cmd_archive(args, store: ProfileStore, catalog: Catalog) -> int:
     elif args.archive_cmd == "delete":
         archive_mod.delete_archive_row(profile, args.archive_db, args.version_id)
         print(f"アーカイブから削除しました: {args.version_id}")
+        # ローカルカタログに対応するバージョンがあれば同期して消す (孤児エントリ防止)
+        try:
+            rec = catalog.get_backup(args.version_id)
+        except PgBackupError:
+            rec = None
+        if (rec and rec["mode"] == "archive"
+                and rec["archive_profile"] == profile.name
+                and rec["archive_db"] == args.archive_db):
+            catalog.delete_backup(args.version_id)
+            print(f"カタログからも削除しました: {args.version_id}")
     return 0
 
 
@@ -280,15 +293,16 @@ def build_parser() -> argparse.ArgumentParser:
     pb.add_argument("--db", action="append", help="対象 DB (複数指定可)")
     pb.add_argument("--all", action="store_true", help="テンプレート以外の全 DB を対象にする")
     pb.add_argument("--mode", choices=["file", "archive", "clone"], default="file")
-    pb.add_argument("--fmt", choices=["plain", "custom"], default="plain",
-                    help="file モードの形式 (plain=SQL ファイル, custom=pg_restore 用)")
+    pb.add_argument("--fmt", choices=["plain", "custom"], default=None,
+                    help="file モードの形式 (plain=SQL ファイル [既定], custom=pg_restore 用)")
     pb.add_argument("--out", help="file モードの出力先 (ファイルまたはディレクトリ)")
     pb.add_argument("--dest", help="archive/clone モードの保存先プロファイル (archive の既定は元と同じ)")
     pb.add_argument("--dest-db", help="clone モードの複製先 DB 名 (既定: 元と同名)")
     pb.add_argument("--archive-db", default=DEFAULT_ARCHIVE_DB,
                     help=f"archive モードの格納 DB 名 (既定: {DEFAULT_ARCHIVE_DB})")
     pb.add_argument("--drop", action="store_true", help="clone: 複製先に同名 DB があれば削除して作り直す")
-    pb.add_argument("--keep-owner", action="store_true", help="所有者・権限情報も復元する")
+    pb.add_argument("--keep-owner", action="store_true",
+                    help="clone / file(plain): 所有者・権限情報も含める (既定は移植性優先で除外)")
     pb.add_argument("--note", help="バージョンに付けるメモ")
     pb.set_defaults(func=cmd_backup)
 
@@ -359,6 +373,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     store = ProfileStore()
     catalog = Catalog()
+    config.cleanup_tmp()
     try:
         return args.func(args, store, catalog)
     except PgBackupError as e:

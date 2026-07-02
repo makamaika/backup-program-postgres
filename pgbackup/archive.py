@@ -160,6 +160,9 @@ def fetch_dump(
         h = hashlib.sha256()
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "wb") as f, conn.cursor(name="pgbackup_fetch") as cur:
+            # 既定の itersize=100 だと 16MB チャンク x 100 行 = 約 1.6GB を
+            # 一度にメモリへ読むため、必ず 1 行ずつフェッチする
+            cur.itersize = 1
             cur.execute(
                 "SELECT data FROM pgbackup_archive_chunk WHERE backup_id = %s ORDER BY seq",
                 (meta["id"],),
