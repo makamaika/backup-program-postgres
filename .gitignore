@@ -1,0 +1,20 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Runtime data (connection profiles contain passwords - never commit)
+pgbackup_home/
+connections.json
+catalog.db
+*.dump
+backups/
+
+# OS
+Thumbs.db
+.DS_Store
