@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -57,10 +58,13 @@ class Catalog:
         with self._conn() as conn:
             conn.executescript(_SCHEMA)
 
-    def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=30)
-        conn.row_factory = sqlite3.Row
-        return conn
+    @contextmanager
+    def _conn(self):
+        """接続を開き、正常時はコミット、終了時は必ずクローズする。"""
+        with closing(sqlite3.connect(self.path, timeout=30)) as conn:
+            conn.row_factory = sqlite3.Row
+            with conn:
+                yield conn
 
     # ---- バージョン ----
 
