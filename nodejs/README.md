@@ -60,7 +60,7 @@ nodejs/
 │   └── web/
 │       ├── server.js    # Express + バックグラウンドジョブ
 │       └── static/index.html  # SPA (Python 版と共通)
-└── tests/               # E2E テスト (CLI 32 件 + Web 15 件)
+└── tests/               # E2E テスト (CLI 35 件 + Web 17 件)
 ```
 
 ## テスト
@@ -70,8 +70,8 @@ Python 版と同じテストクラスタ・シードデータを使います
 
 ```powershell
 $env:PGBACKUP_HOME = "C:\tmp\pghome-node"
-node tests\e2e_cli.test.js   # CLI  : 32 テスト
-node tests\e2e_web.test.js   # Web  : 15 テスト
+node tests\e2e_cli.test.js   # CLI  : 35 テスト
+node tests\e2e_web.test.js   # Web  : 17 テスト
 ```
 
 セキュリティ・安全性・既知の制限は [Python 版 README](../README.md) の記載と共通です。
