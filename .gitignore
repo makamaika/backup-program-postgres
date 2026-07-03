@@ -18,5 +18,5 @@ backups/
 # OS
 Thumbs.db
 .DS_Store
-.claude/launch.json
+.claude/
 node_modules/
