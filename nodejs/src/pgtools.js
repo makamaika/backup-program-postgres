@@ -204,12 +204,13 @@ export function pipeDumpRestore(src, srcDb, dest, destDb, keepOwner = false) {
     restore.stderr.on("data", (d) => { if (restoreErr.length < STDERR_TAIL * 4) restoreErr += d; });
 
     dump.stdout.pipe(restore.stdin);
-    // pg_restore が先に死ぬと pipe 書き込みが EPIPE になる (pg_dump 側も終了する)
+    // pg_restore が先に死ぬと pipe 書き込みが EPIPE になる
     restore.stdin.on("error", () => {});
 
-    let dumpCode = null, restoreCode = null, spawnFailed = false;
+    let dumpCode = null, restoreCode = null, settled = false;
     const finish = () => {
-      if (spawnFailed || dumpCode === null || restoreCode === null) return;
+      if (settled || dumpCode === null || restoreCode === null) return;
+      settled = true;
       if (dumpCode === 0 && restoreCode === 0) return resolve();
       // 根本原因を見せるため両方のエラーをまとめ、pg_restore を先に報告する
       const parts = [];
@@ -217,9 +218,28 @@ export function pipeDumpRestore(src, srcDb, dest, destDb, keepOwner = false) {
       if (dumpCode !== 0) parts.push(`pg_dump (exit=${dumpCode}):\n${tail(dumpErr)}`);
       reject(new ToolError("複製に失敗しました:\n" + parts.join("\n\n")));
     };
-    dump.on("error", (e) => { spawnFailed = true; reject(new ToolError(`pg_dump を起動できません: ${e.message}`)); });
-    restore.on("error", (e) => { spawnFailed = true; reject(new ToolError(`pg_restore を起動できません: ${e.message}`)); });
+    dump.on("error", (e) => {
+      if (settled) return;
+      settled = true;
+      restore.kill(); // 相方を待たせたまま残さない
+      reject(new ToolError(`pg_dump を起動できません: ${e.message}`));
+    });
+    restore.on("error", (e) => {
+      if (settled) return;
+      settled = true;
+      dump.kill();
+      reject(new ToolError(`pg_restore を起動できません: ${e.message}`));
+    });
     dump.on("close", (code) => { dumpCode = code ?? -1; finish(); });
-    restore.on("close", (code) => { restoreCode = code ?? -1; finish(); });
+    restore.on("close", (code) => {
+      restoreCode = code ?? -1;
+      if (restoreCode !== 0 && dumpCode === null) {
+        // pg_restore が先に失敗すると pipe() が unpipe/pause して pg_dump が
+        // パイプ詰まりで永久ブロックする。読み捨てに切替えて確実に終了させる。
+        dump.stdout.resume();
+        dump.kill();
+      }
+      finish();
+    });
   });
 }

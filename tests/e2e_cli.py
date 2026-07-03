@@ -89,6 +89,8 @@ def main() -> int:
     # 再実行に備えたクリーンアップ (バージョン番号を決定的にするためカタログも消す)
     (Path(home) / "catalog.db").unlink(missing_ok=True)
     shutil.rmtree(Path(home) / "backups", ignore_errors=True)
+    (Path(home) / "dup_out.sql").unlink(missing_ok=True)
+    (Path(home) / "multi.sql").unlink(missing_ok=True)
     for port, dbs in (
         (PORT_A, ["shop_db_copy", "shop_db_arch1", "shop_db_arch2", "shop_db_file",
                   "analytics_db", "BACK_UP_DB", "inventory_web_restore"]),

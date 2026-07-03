@@ -13,7 +13,7 @@
 
 import readline from "node:readline";
 
-import { Command } from "commander";
+import { Command, InvalidArgumentError } from "commander";
 
 import * as archiveMod from "./archive.js";
 import * as backupMod from "./backup.js";
@@ -70,21 +70,45 @@ function sizeFmt(n) {
   return "";
 }
 
-// パスワードの非表示入力
+// パスワードの非表示入力。
+// - マスクは stdin が TTY かどうかで判定する (stdout リダイレクト時も平文表示しない)
+// - Ctrl+C / EOF では未解決 Promise で黙って終了せず、エラーとして中断する
 function askHidden(promptText) {
-  return new Promise((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    const orig = rl._writeToOutput.bind(rl);
+  return new Promise((resolve, reject) => {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stderr,
+      terminal: process.stdin.isTTY === true,
+    });
+    let answered = false;
+    if (rl.terminal) {
+      const orig = rl._writeToOutput.bind(rl);
+      rl._writeToOutput = (str) => {
+        if (str.includes(promptText)) orig(promptText);
+      };
+    }
+    rl.on("SIGINT", () => rl.close());
+    rl.on("close", () => {
+      if (!answered) reject(new PgBackupError("パスワード入力が中断されました"));
+    });
     rl.question(promptText, (answer) => {
-      rl._writeToOutput = orig;
+      answered = true;
       rl.close();
-      process.stdout.write("\n");
+      process.stderr.write("\n");
       resolve(answer);
     });
-    rl._writeToOutput = (str) => {
-      if (str.includes(promptText)) orig(promptText);
-    };
   });
+}
+
+// commander 用の数値バリデータ
+function intArg(label, min, max) {
+  return (value) => {
+    const n = Number(value);
+    if (!/^\d+$/.test(value) || !Number.isInteger(n) || n < min || n > max) {
+      throw new InvalidArgumentError(`${label} は ${min}〜${max} の整数で指定してください`);
+    }
+    return n;
+  };
 }
 
 function collect(value, previous) {
@@ -110,7 +134,7 @@ export async function main(argv) {
     .command("add <name>")
     .description("プロファイルを追加")
     .option("--host <host>", "ホスト", "localhost")
-    .option("--port <port>", "ポート", "5432")
+    .option("--port <port>", "ポート", intArg("ポート", 1, 65535), 5432)
     .option("--user <user>", "ユーザー", "postgres")
     .option("--password <password>", "パスワード (履歴に残るため --ask-password 推奨)")
     .option("--ask-password", "対話的にパスワードを入力")
@@ -121,7 +145,7 @@ export async function main(argv) {
       let password = opts.password ?? null;
       if (opts.askPassword) password = await askHidden("パスワード: ");
       const profile = makeProfile(name, {
-        host: opts.host, port: Number(opts.port), user: opts.user,
+        host: opts.host, port: opts.port, user: opts.user,
         password, dbname: opts.dbname, sslmode: opts.sslmode ?? null,
       });
       store.add(profile, Boolean(opts.overwrite));
@@ -162,7 +186,7 @@ export async function main(argv) {
     .description("DB の構造・データ型の確認")
     .option("--schema <schema>", "スキーマで絞り込み")
     .option("--table <table>", "テーブルの詳細 (カラム・インデックス) を表示")
-    .option("--sample <n>", "--table 指定時にデータの先頭 N 行を表示", "0")
+    .option("--sample <n>", "--table 指定時にデータの先頭 N 行を表示", intArg("サンプル行数", 0, 200), 0)
     .action(async (name, db, opts) => {
       const profile = store.get(name);
       if (opts.table) {
@@ -176,7 +200,7 @@ export async function main(argv) {
         printTable(await inspectMod.tableIndexes(profile, db, schema, opts.table), [
           ["name", "名前"], ["definition", "定義"],
         ]);
-        const n = Number(opts.sample);
+        const n = opts.sample;
         if (n > 0) {
           console.log(`\n== 先頭 ${n} 行 ==`);
           const sample = await inspectMod.tableSample(profile, db, schema, opts.table, n);
@@ -356,9 +380,9 @@ export async function main(argv) {
   program
     .command("history")
     .description("操作履歴の表示")
-    .option("--limit <n>", "", "50")
+    .option("--limit <n>", "表示件数", intArg("limit", 1, 10000), 50)
     .action((opts) => {
-      const rows = catalog.listOperations(Number(opts.limit)).map((r) => ({
+      const rows = catalog.listOperations(opts.limit).map((r) => ({
         ...r, ok_h: r.ok ? "OK" : "失敗",
       }));
       printTable(rows, [
@@ -370,15 +394,18 @@ export async function main(argv) {
   program
     .command("web")
     .description("ローカル Web UI を起動")
-    .option("--host <host>", "", "127.0.0.1")
-    .option("--port <port>", "", "8501")
+    .option("--host <host>", "バインド先 (公開しないこと)", "127.0.0.1")
+    .option("--port <port>", "ポート", intArg("ポート", 1, 65535), 8501)
     .action(async (opts) => {
       const { createApp } = await import("./web/server.js");
       const app = createApp();
-      app.listen(Number(opts.port), opts.host, () => {
-        console.log(`Web UI: http://${opts.host}:${opts.port}/  (Ctrl+C で終了)`);
-      });
-      await new Promise(() => {}); // サーバー稼働中は戻らない
+      await new Promise((resolve, reject) => {
+        const server = app.listen(opts.port, opts.host, () => {
+          console.log(`Web UI: http://${opts.host}:${opts.port}/  (Ctrl+C で終了)`);
+        });
+        // ポート使用中などの listen 失敗を生スタックではなくメッセージで伝える
+        server.on("error", (e) => reject(new PgBackupError(`Web サーバーを起動できません: ${e.message}`)));
+      }); // サーバー稼働中は戻らない
     });
 
   try {

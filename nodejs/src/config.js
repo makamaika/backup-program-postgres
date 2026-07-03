@@ -90,22 +90,27 @@ export class ProfileStore {
   }
 
   _loadRaw() {
-    if (!fs.existsSync(this.path)) return { profiles: {} };
-    return JSON.parse(fs.readFileSync(this.path, "utf-8"));
+    if (!fs.existsSync(this.path)) return { profiles: Object.create(null) };
+    const raw = JSON.parse(fs.readFileSync(this.path, "utf-8"));
+    // '__proto__' や 'constructor' のような名前をデータとして安全に扱えるよう
+    // プロトタイプなしオブジェクトへ移し替える
+    raw.profiles = Object.assign(Object.create(null), raw.profiles ?? {});
+    return raw;
   }
 
   _saveRaw(data) {
     fs.mkdirSync(path.dirname(this.path), { recursive: true });
     const tmp = this.path + ".tmp";
     fs.writeFileSync(tmp, JSON.stringify(data, null, 2), "utf-8");
-    // Windows では対象を開いているプロセスがいると rename が一時的に失敗し得る
+    // Windows では対象を開いているプロセスがいると rename が一時的に失敗し得る。
+    // 同期 API のため待ちも同期だが、競合時のみ・最大 250ms に抑えている。
     for (let attempt = 0; ; attempt++) {
       try {
         fs.renameSync(tmp, this.path);
         return;
       } catch (e) {
         if (attempt >= 4 || (e.code !== "EPERM" && e.code !== "EACCES" && e.code !== "EBUSY")) throw e;
-        const until = Date.now() + 100 * (attempt + 1);
+        const until = Date.now() + 50;
         while (Date.now() < until) { /* 短い同期待ち */ }
       }
     }
@@ -118,12 +123,11 @@ export class ProfileStore {
 
   get(name) {
     const raw = this._loadRaw();
-    const attrs = raw.profiles[name];
-    if (attrs === undefined) {
+    if (!Object.hasOwn(raw.profiles, name)) {
       const known = Object.keys(raw.profiles).sort().join(", ") || "(なし)";
       throw new ProfileError(`接続プロファイル '${name}' が見つかりません。登録済み: ${known}`);
     }
-    return makeProfile(name, attrs);
+    return makeProfile(name, raw.profiles[name]);
   }
 
   add(profile, overwrite = false) {
@@ -133,8 +137,11 @@ export class ProfileStore {
         "英数字・アンダースコアで始まり、英数字・「_ . -」のみ 64 文字以内で指定してください。"
       );
     }
+    if (!Number.isInteger(profile.port) || profile.port < 1 || profile.port > 65535) {
+      throw new ProfileError(`ポート番号が不正です: ${profile.port} (1〜65535 の整数)`);
+    }
     const raw = this._loadRaw();
-    if (raw.profiles[profile.name] !== undefined && !overwrite) {
+    if (Object.hasOwn(raw.profiles, profile.name) && !overwrite) {
       throw new ProfileError(`接続プロファイル '${profile.name}' は既に存在します (--overwrite で上書き)`);
     }
     const { name, ...attrs } = profile;
@@ -144,7 +151,7 @@ export class ProfileStore {
 
   remove(name) {
     const raw = this._loadRaw();
-    if (raw.profiles[name] === undefined) {
+    if (!Object.hasOwn(raw.profiles, name)) {
       throw new ProfileError(`接続プロファイル '${name}' が見つかりません`);
     }
     delete raw.profiles[name];

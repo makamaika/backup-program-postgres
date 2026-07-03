@@ -29,9 +29,11 @@ export function sha256OfFile(filePath) {
   });
 }
 
-// DB 名をファイル/ディレクトリ名に使える形に変換する
+// DB 名をファイル/ディレクトリ名に使える形に変換する。
+// JS の \w は ASCII 限定のため、Python 版 (Unicode \w) と揃えて
+// Unicode の文字・数字を残す — 日本語 DB 名同士がパス衝突しないようにする。
 function safeName(name) {
-  return String(name).replace(/[^\w.-]/gu, "_");
+  return String(name).replace(/[^\p{L}\p{N}_.-]/gu, "_");
 }
 
 function majorOf(versionText) {
@@ -112,7 +114,12 @@ function resolveOutPath(out, profile, db, versionNo, fmt) {
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "").replace("T", "T");
   const autoName = `${safeName(db)}_v${versionNo}_${stamp}.${ext}`;
   if (out === null || out === undefined) {
-    return path.join(backupsDir(), safeName(profile.name), safeName(db), autoName);
+    let p = path.join(backupsDir(), safeName(profile.name), safeName(db), autoName);
+    if (fs.existsSync(p)) {
+      // safeName で別 DB 名が同じ表記に潰れた場合等でも上書きしない
+      p = p.replace(`.${ext}`, `_${crypto.randomBytes(2).toString("hex")}.${ext}`);
+    }
+    return p;
   }
   const isDir = (fs.existsSync(out) && fs.statSync(out).isDirectory()) || /[\\/]$/.test(String(out));
   if (isDir) return path.join(String(out), autoName);

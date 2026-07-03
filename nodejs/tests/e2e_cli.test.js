@@ -100,6 +100,8 @@ async function main() {
   // 再実行に備えたクリーンアップ (バージョン番号を決定的にするためカタログも消す)
   fs.rmSync(path.join(HOME, "catalog.db"), { force: true });
   fs.rmSync(path.join(HOME, "backups"), { recursive: true, force: true });
+  fs.rmSync(path.join(HOME, "dup_out.sql"), { force: true });
+  fs.rmSync(path.join(HOME, "multi.sql"), { force: true });
   const cleanup = [
     [PORT_A, ["shop_db_copy", "shop_db_arch1", "shop_db_arch2", "shop_db_file",
               "analytics_db", "BACK_UP_DB", "inventory_web_restore"]],
@@ -316,6 +318,30 @@ async function main() {
     const out = run(["conn", "add", "bad/name", "--host", "localhost", "--port", String(PORT_A)],
                     { expectFail: true });
     assert.ok(out.includes("使用できません"));
+  });
+
+  await check("異常系: 非数値の --port / --limit は明示的に拒否される", () => {
+    const out1 = run(["conn", "add", "badport", "--host", "localhost", "--port", "55x32"],
+                     { expectFail: true });
+    assert.ok(out1.includes("整数"));
+    const out2 = run(["history", "--limit", "abc"], { expectFail: true });
+    assert.ok(out2.includes("整数"));
+  });
+
+  await check("異常系: 到達不能な複製先はハングせずエラーになる", () => {
+    run(["conn", "add", "deadport", "--host", "localhost", "--port", "59999",
+         "--user", USER, "--overwrite"]);
+    const out = run(["backup", "local", "--db", "shop_db", "--mode", "clone",
+                     "--dest", "deadport"], { expectFail: true });
+    assert.ok(out.includes("接続失敗") || out.includes("失敗"));
+  });
+
+  await check("プロトタイプ名 (__proto__) のプロファイルも正しく登録・削除できる", () => {
+    run(["conn", "add", "__proto__", "--host", "localhost", "--port", String(PORT_A),
+         "--user", USER, "--overwrite"]);
+    assert.ok(run(["conn", "list"]).includes("__proto__"));
+    run(["conn", "remove", "__proto__"]);
+    assert.ok(!run(["conn", "list"]).includes("__proto__"));
   });
 
   console.log(`\n結果: ${passed} passed, ${failed} failed`);

@@ -1,6 +1,9 @@
 // pg (node-postgres) による接続ヘルパー。
 
 import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import pg from "pg";
 
@@ -21,32 +24,49 @@ export function quoteLiteral(value) {
   return "'" + String(value).replaceAll("'", "''") + "'";
 }
 
-function sslOption(sslmode) {
-  if (!sslmode || sslmode === "disable") return undefined;
-  if (sslmode === "require" || sslmode === "prefer" || sslmode === "allow") {
-    return { rejectUnauthorized: false };
+// libpq の sslmode 互換の接続試行リスト (pg ドライバは fallback を持たないため自前で行う)。
+// 既定 (未指定) は libpq と同じ 'prefer' 相当: SSL を試し、非対応サーバーには平文で再接続。
+function sslAttempts(sslmode) {
+  if (sslmode === "disable") return [false];
+  if (sslmode === "require") return [{ rejectUnauthorized: false }];
+  if (sslmode === "verify-ca" || sslmode === "verify-full") {
+    const rootCrt = path.join(os.homedir(), ".postgresql", "root.crt");
+    return [fs.existsSync(rootCrt) ? { ca: fs.readFileSync(rootCrt, "utf-8") } : true];
   }
-  return true; // verify-ca / verify-full: 証明書検証あり
+  // prefer / allow / 未指定
+  return [{ rejectUnauthorized: false }, false];
+}
+
+function isSslUnsupported(err) {
+  return /does not support SSL/i.test(err?.message ?? "");
 }
 
 export async function connect(profile, dbname = null) {
-  const client = new Client({
-    host: profile.host,
-    port: profile.port,
-    user: profile.user,
-    password: profile.password ?? undefined, // 未設定なら PGPASSWORD 環境変数等に委ねる
-    database: dbname || profile.dbname,
-    connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
-    ssl: sslOption(profile.sslmode),
-  });
-  try {
-    await client.connect();
-  } catch (e) {
-    throw new PgBackupError(
-      `接続失敗 [${profile.name}] ${profileDisplay(profile)} db=${dbname || profile.dbname}: ${e.message}`
-    );
+  const attempts = sslAttempts(profile.sslmode);
+  let lastErr = null;
+  for (let i = 0; i < attempts.length; i++) {
+    const client = new Client({
+      host: profile.host,
+      port: profile.port,
+      user: profile.user,
+      password: profile.password ?? undefined, // 未設定なら PGPASSWORD 環境変数等に委ねる
+      database: dbname || profile.dbname,
+      connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
+      ssl: attempts[i] === false ? undefined : attempts[i],
+    });
+    try {
+      await client.connect();
+      return client;
+    } catch (e) {
+      lastErr = e;
+      await client.end().catch(() => {});
+      // SSL 非対応サーバーだった場合のみ次の試行 (平文) へフォールバック
+      if (!(i + 1 < attempts.length && isSslUnsupported(e))) break;
+    }
   }
-  return client;
+  throw new PgBackupError(
+    `接続失敗 [${profile.name}] ${profileDisplay(profile)} db=${dbname || profile.dbname}: ${lastErr.message}`
+  );
 }
 
 // 接続を開いて fn を実行し、必ずクローズする
@@ -127,16 +147,18 @@ function trashName(dbname) {
 }
 
 // クラスタの一意識別子。ホスト名の表記ゆれ (localhost / 127.0.0.1 等) に
-// 影響されない同一サーバー判定に使う。取得できない場合は host:port にフォールバック。
+// 影響されない同一サーバー判定に使う。
+// 接続自体の失敗は握りつぶさず伝播させる (安全ガードを fail-open にしない)。
+// クエリが権限等で失敗した場合のみ host:port にフォールバックする。
 export async function clusterIdentity(profile) {
-  try {
-    return await withConn(profile, null, async (c) => {
+  return withConn(profile, null, async (c) => {
+    try {
       const r = await c.query("SELECT system_identifier FROM pg_control_system()");
       return `pg:${r.rows[0].system_identifier}:${profile.port}`;
-    });
-  } catch {
-    return `addr:${profile.host.toLowerCase()}:${profile.port}`;
-  }
+    } catch {
+      return `addr:${profile.host.toLowerCase()}:${profile.port}`;
+    }
+  });
 }
 
 export async function sameCluster(a, b) {
@@ -160,6 +182,13 @@ export async function withReplaceDatabase(profile, dbname, { drop = false, encod
     trash = trashName(dbname);
     await renameDatabase(profile, dbname, trash);
   }
+  // Ctrl+C の既定動作 (即プロセス終了) では退避 DB が置き去りになる。
+  // クリティカルセクション中はシグナルでの即死を防ぎ、子プロセスの死による
+  // 失敗経路 (下の catch) にロールバックさせてから終了コード 130 で抜ける。
+  let interrupted = false;
+  const onSignal = () => { interrupted = true; };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
   try {
     await createDatabase(profile, dbname, encoding);
     const result = await fn();
@@ -170,5 +199,9 @@ export async function withReplaceDatabase(profile, dbname, { drop = false, encod
     await dropDatabase(profile, dbname).catch(() => {});
     if (trash !== null) await renameDatabase(profile, trash, dbname).catch(() => {});
     throw e;
+  } finally {
+    process.removeListener("SIGINT", onSignal);
+    process.removeListener("SIGTERM", onSignal);
+    if (interrupted) process.exitCode = 130;
   }
 }

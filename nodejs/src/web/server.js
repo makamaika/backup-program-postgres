@@ -72,9 +72,21 @@ class JobManager {
 }
 
 function requireQ(req, name) {
-  const v = req.query[name];
+  const raw = req.query[name];
+  const v = Array.isArray(raw) ? raw[0] : raw; // 重複パラメータは先頭を採用
   if (v === undefined || v === "") throw new PgBackupError(`クエリパラメータ '${name}' は必須です`);
   return String(v);
+}
+
+function optQ(req, name) {
+  const raw = req.query[name];
+  const v = Array.isArray(raw) ? raw[0] : raw;
+  return v === undefined || v === "" ? null : String(v);
+}
+
+function limitQ(req, fallback, max) {
+  const n = Number(Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit);
+  return Number.isInteger(n) && n >= 1 ? Math.min(n, max) : fallback;
 }
 
 export function createApp() {
@@ -148,7 +160,7 @@ export function createApp() {
     const profile = store.get(requireQ(req, "profile"));
     res.json(await inspectMod.tableSample(
       profile, requireQ(req, "db"), requireQ(req, "schema"), requireQ(req, "table"),
-      Number(req.query.limit ?? 10)
+      limitQ(req, 10, 200)
     ));
   });
 
@@ -242,7 +254,7 @@ export function createApp() {
   // ---- バージョン / アーカイブ / 履歴 ----
 
   app.get("/api/versions", (req, res) => {
-    res.json(catalog.listBackups(req.query.profile ?? null, req.query.db ?? null));
+    res.json(catalog.listBackups(optQ(req, "profile"), optQ(req, "db")));
   });
 
   app.get("/api/archive", async (req, res) => {
@@ -251,7 +263,7 @@ export function createApp() {
   });
 
   app.get("/api/history", (req, res) => {
-    res.json(catalog.listOperations(Number(req.query.limit ?? 100)));
+    res.json(catalog.listOperations(limitQ(req, 100, 10000)));
   });
 
   // ---- ジョブ ----
@@ -262,11 +274,11 @@ export function createApp() {
   // ---- エラーハンドリング ----
 
   app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
-    if (err instanceof PgBackupError) {
-      res.status(err.httpStatus ?? 400).json({ detail: err.message });
-    } else {
-      res.status(500).json({ detail: err.message });
-    }
+    // express.json() のパースエラー等は err.status を持つ (例: 400) — 500 に潰さない
+    const status = err instanceof PgBackupError
+      ? (err.httpStatus ?? 400)
+      : (err.status ?? err.statusCode ?? 500);
+    res.status(status).json({ detail: err.message });
   });
 
   return app;

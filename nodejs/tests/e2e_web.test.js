@@ -199,6 +199,22 @@ async function main() {
     await check("異常系: 存在しないジョブは 404", async () => {
       await assert.rejects(api("/api/jobs/nonexistent"), (e) => e.status === 404);
     });
+
+    await check("異常系: 不正な limit / 壊れた JSON が 500 にならない", async () => {
+      const rows = await api("/api/history?limit=abc"); // 既定値にフォールバック
+      assert.ok(Array.isArray(rows));
+      const res = await fetch(BASE + "/api/backup", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: "{bad json",
+      });
+      assert.strictEqual(res.status, 400);
+    });
+
+    await check("異常系: 不正なポート番号のプロファイル登録は 400", async () => {
+      await assert.rejects(
+        api("/api/profiles", { body: { name: "badport_web", host: "x", port: "55x32" } }),
+        (e) => e.status === 400
+      );
+    });
   } finally {
     server.kill();
   }
