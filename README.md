@@ -184,6 +184,12 @@ python tests\e2e_cli.py   # CLI  : 27 テスト
 python tests\e2e_web.py   # Web  : 14 テスト
 ```
 
+## ライセンス
+
+MIT License (詳細は [LICENSE](LICENSE) を参照)。Python 版・Node.js 版とも共通です。
+依存ライブラリのうち psycopg は LGPL-3.0 ですが、通常の依存として利用するのみで
+本リポジトリには同梱していません。
+
 ## アーキテクチャ
 
 ```

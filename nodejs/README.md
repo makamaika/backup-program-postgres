@@ -75,3 +75,7 @@ node tests\e2e_web.test.js   # Web  : 17 テスト
 ```
 
 セキュリティ・安全性・既知の制限は [Python 版 README](../README.md) の記載と共通です。
+
+## ライセンス
+
+MIT License (リポジトリルートの [LICENSE](../LICENSE) を参照)。

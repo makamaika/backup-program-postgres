@@ -1,11 +1,13 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pgbackup"
 version = "0.1.0"
 description = "PostgreSQL backup / restore / versioning tool with CLI and local Web UI"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
     "psycopg[binary]>=3.2",
