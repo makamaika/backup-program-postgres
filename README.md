@@ -40,13 +40,38 @@ PostgreSQL データベースのバックアップ・複製・リストアを **
 git clone https://github.com/makamaika/backup-program-postgres.git
 cd backup-program-postgres
 python -m venv .venv
-# Windows
-.venv\Scripts\pip install -e .
-# Linux / macOS
-.venv/bin/pip install -e .
 ```
 
-以後 `pgbackup` コマンド (または `python -m pgbackup`) が使えます。
+仮想環境を**有効化してから**インストールします (有効化を忘れると、システムの
+Python にはライブラリが入っていないため `ModuleNotFoundError: No module named
+'psycopg'` になります):
+
+```powershell
+# Windows (PowerShell)
+.\.venv\Scripts\Activate.ps1
+pip install -e .
+```
+
+```bash
+# Linux / macOS
+source .venv/bin/activate
+pip install -e .
+```
+
+有効化中はプロンプトの先頭に `(.venv)` が付き、`pgbackup` コマンド
+(または `python -m pgbackup`) が使えます。新しいターミナルを開いたときは
+毎回 有効化が必要です。
+
+有効化せずに使いたい場合は、venv 内の実行ファイルをフルパスで指定します:
+
+```powershell
+.\.venv\Scripts\pgbackup.exe --help
+```
+
+> **注意**: `python -m pgbackup` を仮想環境の外で実行すると `psycopg` が
+> 見つからずエラーになります。`python` がどこを指しているかは
+> `python -c "import sys; print(sys.executable)"` で確認できます
+> (末尾が `.venv\Scripts\python.exe` になっていれば有効化済みです)。
 
 ## クイックスタート (CLI)
 
