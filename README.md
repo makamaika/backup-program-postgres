@@ -19,6 +19,8 @@ PostgreSQL データベースのバックアップ・複製・リストアを **
 |---|---|
 | DB 一覧表示 | ローカル / リモートサーバー上のデータベース一覧 (所有者・エンコーディング・サイズ) |
 | 構造の確認 | スキーマ / テーブル / カラム定義 / インデックス / データのサンプル / 保存されているデータ型の内訳 |
+| 視覚的なデータ編集 | Webの型別フォームで行の追加・更新・削除。主キー/一意キーとETagで対象・競合を検証 |
+| DB間比較・結合・上書き | 型互換テーブルをキーで比較し、`merge` (追加＋更新) または `sync` (完全同期) をプレビュー後に実行 |
 | ファイルバックアップ | pg_dump で SQL ファイル (`.sql`) またはカスタム形式 (`.dump`) に出力 |
 | アーカイブバックアップ | 指定サーバー上に **BACK_UP_DB** を自動作成し、すべてのバックアップを 1 つの DB に蓄積 |
 | HTTPS バックアップエージェント | PostgreSQL のポートを公開せず、一時起動した専用 HTTPS サーバー経由で別端末へ保存・取得・任意で復元 |
@@ -119,6 +121,22 @@ pgbackup archive restore local remote/shop_db@v3 --dest local --db shop_db_x
 
 # 8. 操作履歴
 pgbackup history
+
+# 9. 行の表示・編集
+pgbackup data rows local shop_db customers --limit 20 --json
+pgbackup data insert local shop_db customers --values '{"name":"Alice","email":"alice@example.com"}'
+pgbackup data update local shop_db customers \
+  --key '{"id":1}' --values '{"name":"Alice Updated"}' --etag ETAG
+
+# 10. テーブル比較 (データ変更なし)
+pgbackup data compare local shop_db edit_source \
+  --target-profile local --target-db shop_db --target-table edit_target --json
+
+# 11. compareで得たplan_hashと確認文字列を使って適用
+pgbackup data apply local shop_db edit_source \
+  --target-profile local --target-db shop_db --target-table edit_target \
+  --strategy merge --plan-hash PLAN_HASH \
+  --confirm 'local@localhost:5432/shop_db/public.edit_target'
 ```
 
 ## Web UI
@@ -136,6 +154,8 @@ pgbackup web --port 9000
 - **データベース**: DB 一覧 → 構造ビューア
   (スキーマツリー、カラム定義・型・PK・インデックス、データのサンプル表示、
   DB に保存されているデータ型の内訳)
+- **データ編集・比較**: テーブル選択 → ページングされた行グリッド → 型別フォームで
+  追加・編集・削除。別DB/別接続のテーブルとの差分プレビュー、merge、sync
 - **バックアップ**: file / archive / clone / agent を画面から実行 (進捗は右下のジョブパネル)
 - **バージョン・リストア**: バージョン一覧・アーカイブの中身・ダンプファイルからのリストア
 - **履歴**: 全操作の記録
@@ -212,6 +232,48 @@ pgbackup agent restore backup-pc BACKUP_ID --remote-profile local --db shop_db_r
 
 登録後は `pairing-backup-pc.json` を安全に削除し、作業終了後はサーバーを `Ctrl+C` で停止します。
 通常の `pgbackup restore <version-id>` は、`agent` モードのバージョンも自動取得して復元できます。
+
+## データ編集・テーブル比較・merge/sync
+
+### 行編集
+
+- 実テーブルの行を最大200件ずつページ表示します
+- `INSERT` は権限があれば利用できます。デフォルト値・NULL・値を列ごとに選択できます
+- `UPDATE` / `DELETE` は、主キーまたは「全列 NOT NULL の非遅延 UNIQUE 制約」を
+  行キーとして使える場合だけ有効になります。キーがないテーブルは自動的に読み取り専用です
+- 表示時に行全体から `etag` を生成し、保存直前に `SELECT ... FOR UPDATE` で再取得して比較します。
+  表示後に別ユーザー/処理が変更した行は上書きせず、再読み込みを要求します
+- 列名・テーブル名は識別子としてクォートし、入力値はすべてパラメータバインドします。
+  Web/CLIから任意SQLを実行する機能はありません
+- PostgreSQLの権限、CHECK、FOREIGN KEY、トリガー、Row Level Securityはそのまま適用されます
+
+### 比較と適用
+
+比較キーは両テーブルで非NULLのPRIMARY KEY/UNIQUEである必要があります。列名が同じものを対象に、
+同一型のほか、数値型同士、文字列型同士、`json`/`jsonb`を互換として扱います。生成列は
+比較・上書き対象外です。既定の比較上限は10,000行、設定可能な最大は50,000行です。
+
+| 操作 | 動作 |
+|---|---|
+| `compare` | 追加候補・更新候補・比較先だけにある行・同一行を表示。データは変更しない |
+| `merge` | 比較元だけにある行を追加し、同じキーで内容が異なる行を更新。比較先だけの行は残す |
+| `sync` | mergeに加え、比較先だけにある行も削除し、比較先を比較元と同じ状態にする |
+
+`compare`は元データ・先データ・列構成・接続先ホスト/ポートから`plan_hash`を生成します。
+適用時は以下をすべて行います:
+
+1. 比較元をREPEATABLE READの読み取り専用トランザクションで固定
+2. 比較先をSERIALIZABLEトランザクションにし、対象テーブルをロック
+3. 差分を再計算し、`plan_hash`が変わっていれば中止
+4. 接続名・ホスト・ポート・DB・テーブルを含む確認文字列を検証
+5. 全INSERT/UPDATE/DELETEを1トランザクションで実行し、1件でも失敗すれば全ロールバック
+
+実効的なRow Level Securityがある場合は全行を確認できないため、行編集はポリシーで見える範囲に
+限定し、テーブル全体のcompare/merge/syncは拒否します。
+
+> **重要**: `sync`は比較先だけにある行を削除します。先にバックアップを取得し、Webの
+> 差分プレビューまたはCLIの`--json`を確認してください。編集用接続には必要なテーブルだけの
+> `SELECT/INSERT/UPDATE/DELETE`を与え、スーパーユーザーを日常編集に使わないことを推奨します。
 
 ## バージョン管理の仕組み
 
@@ -294,7 +356,10 @@ $env:PGBACKUP_HOME = "C:\tmp\pghome"
 python tests\e2e_cli.py   # Python CLI
 python tests\e2e_web.py   # Python Web: 16 テスト
 python tests\e2e_agent.py # HTTPS agent + Python/Node/Web 相互運用: 15 テスト
+python tests\e2e_data.py  # CRUD/型/ETag/比較/merge/sync/Python-Node-Web: 17 テスト
 ```
+
+Node CLI 35件・Node Web 19件を含め、全スイート合計135件です。
 
 ## ライセンス
 
@@ -310,6 +375,7 @@ pgbackup/
 ├── db.py        # psycopg 接続・CREATE/DROP DATABASE ヘルパー
 ├── pgtools.py   # pg_dump / pg_restore / psql の検出と実行、パイプ複製
 ├── inspect.py   # DB 一覧・構造・データ型内訳・サンプル取得
+├── dataedit.py  # 型対応CRUD・ETag・テーブル比較・merge/sync
 ├── catalog.py   # バージョンカタログ + 操作履歴 (SQLite)
 ├── archive.py   # BACK_UP_DB への格納 (16MB チャンク bytea + sha256)
 ├── backup.py    # file / archive / clone / agent の各バックアップモード

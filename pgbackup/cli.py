@@ -22,6 +22,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import __version__, backup as backup_mod, inspect as inspect_mod, restore as restore_mod
+from . import dataedit as dataedit_mod
 from . import archive as archive_mod
 from . import config
 from .agent.client import AgentClient
@@ -64,6 +65,20 @@ def _size_fmt(n) -> str:
             return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
         n /= 1024
     return ""
+
+
+def _json_object(text: str, label: str) -> dict:
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise PgBackupError(f"{label} は有効な JSON オブジェクトで指定してください: {exc}") from exc
+    if not isinstance(value, dict):
+        raise PgBackupError(f"{label} は JSON オブジェクトで指定してください")
+    return value
+
+
+def _print_json(value) -> None:
+    print(json.dumps(value, ensure_ascii=False, indent=2, default=str))
 
 
 # ---------------------------------------------------------------- サブコマンド
@@ -412,6 +427,129 @@ def cmd_agent(args, store: ProfileStore, catalog: Catalog) -> int:
     return 0
 
 
+def cmd_data(args, store: ProfileStore, catalog: Catalog) -> int:
+    profile = store.get(args.profile)
+    if args.data_cmd == "rows":
+        result = dataedit_mod.read_rows(
+            profile,
+            args.db,
+            args.schema,
+            args.table,
+            limit=args.limit,
+            offset=args.offset,
+            order_by=args.order_by,
+            direction=args.direction,
+        )
+        if args.json:
+            _print_json(result)
+            return 0
+        columns = [column["name"] for column in result["metadata"]["columns"]]
+        rows = []
+        for item in result["rows"]:
+            rows.append({**item["values"], "_etag": item["etag"]})
+        _print_table(rows, [(name, name) for name in columns] + [("_etag", "etag")])
+        approx = " (推定)" if result["total_approximate"] else ""
+        print(
+            f"{result['offset'] + 1}〜{result['offset'] + len(rows)} / "
+            f"{result['total_rows']}{approx} 行"
+        )
+        if not result["metadata"]["row_key"]:
+            print("注意: 主キー/非NULL一意キーがないため、このテーブルは読み取り専用です")
+    elif args.data_cmd == "insert":
+        result = dataedit_mod.insert_row(
+            profile, args.db, args.schema, args.table,
+            _json_object(args.values, "--values"),
+        )
+        catalog.log_operation(
+            "data-insert", True, f"行追加: {profile.name}:{args.db}/{args.schema}.{args.table}",
+            {"key": result["key"]},
+        )
+        _print_json(result)
+    elif args.data_cmd == "update":
+        result = dataedit_mod.update_row(
+            profile,
+            args.db,
+            args.schema,
+            args.table,
+            _json_object(args.key, "--key"),
+            _json_object(args.values, "--values"),
+            etag=args.etag,
+            force=args.force,
+        )
+        catalog.log_operation(
+            "data-update", True, f"行更新: {profile.name}:{args.db}/{args.schema}.{args.table}",
+            {"key": result["key"]},
+        )
+        _print_json(result)
+    elif args.data_cmd == "delete":
+        result = dataedit_mod.delete_row(
+            profile,
+            args.db,
+            args.schema,
+            args.table,
+            _json_object(args.key, "--key"),
+            etag=args.etag,
+            force=args.force,
+        )
+        catalog.log_operation(
+            "data-delete", True, f"行削除: {profile.name}:{args.db}/{args.schema}.{args.table}",
+            {"key": result["key"]},
+        )
+        _print_json(result)
+    elif args.data_cmd in ("compare", "apply"):
+        target = store.get(args.target_profile)
+        common = dict(
+            source=profile,
+            source_db=args.db,
+            source_schema=args.schema,
+            source_table=args.table,
+            target=target,
+            target_db=args.target_db,
+            target_schema=args.target_schema,
+            target_table=args.target_table or args.table,
+            key_columns=args.key,
+            max_rows=args.max_rows,
+        )
+        if args.data_cmd == "compare":
+            result = dataedit_mod.compare_tables(
+                **common, preview_rows=args.preview_rows
+            )
+            if args.json:
+                _print_json(result)
+            else:
+                summary = result["summary"]
+                print("== 比較結果 ==")
+                _print_table(
+                    [{**summary}],
+                    [
+                        ("source_rows", "元行数"), ("target_rows", "先行数"),
+                        ("only_source", "追加候補"), ("changed", "更新候補"),
+                        ("only_target", "削除候補(sync)"), ("same", "同一"),
+                    ],
+                )
+                for warning in result["warnings"]:
+                    print(f"警告: {warning}")
+                print(f"plan_hash: {result['plan_hash']}")
+                print(f"確認文字列: {result['confirmation']}")
+                print("適用前に --json で差分詳細も確認してください")
+        else:
+            result = dataedit_mod.apply_table_plan(
+                **common,
+                strategy=args.strategy,
+                expected_plan_hash=args.plan_hash,
+                confirmation=args.confirm,
+            )
+            catalog.log_operation(
+                f"data-{args.strategy}",
+                True,
+                f"{args.strategy}: {profile.name}:{args.db}/{args.schema}.{args.table} -> "
+                f"{target.name}:{args.target_db}/{args.target_schema}.{args.target_table or args.table}",
+                result,
+            )
+            _print_json(result)
+    return 0
+
+
 # ---------------------------------------------------------------- パーサー定義
 
 def build_parser() -> argparse.ArgumentParser:
@@ -595,6 +733,67 @@ def build_parser() -> argparse.ArgumentParser:
     pagr.add_argument("--drop", action="store_true")
     pagr.add_argument("--keep-owner", action="store_true")
     pagr.set_defaults(func=cmd_agent)
+
+    # data editor / compare / merge
+    pdat = sub.add_parser("data", help="行の編集・テーブル比較・merge/sync")
+    pdats = pdat.add_subparsers(dest="data_cmd", required=True)
+
+    def add_table_location(parser):
+        parser.add_argument("profile")
+        parser.add_argument("db")
+        parser.add_argument("table")
+        parser.add_argument("--schema", default="public")
+
+    pdrows = pdats.add_parser("rows", help="テーブルの行をページ表示")
+    add_table_location(pdrows)
+    pdrows.add_argument("--limit", type=int, default=dataedit_mod.DEFAULT_PAGE_SIZE)
+    pdrows.add_argument("--offset", type=int, default=0)
+    pdrows.add_argument("--order-by")
+    pdrows.add_argument("--direction", choices=["asc", "desc"], default="asc")
+    pdrows.add_argument("--json", action="store_true")
+    pdrows.set_defaults(func=cmd_data)
+
+    pdinsert = pdats.add_parser("insert", help="1 行追加")
+    add_table_location(pdinsert)
+    pdinsert.add_argument("--values", required=True, help='JSON 例: {"name":"Alice"}')
+    pdinsert.set_defaults(func=cmd_data)
+
+    pdupdate = pdats.add_parser("update", help="行キーで 1 行更新")
+    add_table_location(pdupdate)
+    pdupdate.add_argument("--key", required=True, help="行キー JSON")
+    pdupdate.add_argument("--values", required=True, help="更新値 JSON")
+    pdupdate.add_argument("--etag", help="data rows が返した etag")
+    pdupdate.add_argument("--force", action="store_true", help="競合検知なしで更新 (非推奨)")
+    pdupdate.set_defaults(func=cmd_data)
+
+    pddelete = pdats.add_parser("delete", help="行キーで 1 行削除")
+    add_table_location(pddelete)
+    pddelete.add_argument("--key", required=True, help="行キー JSON")
+    pddelete.add_argument("--etag", help="data rows が返した etag")
+    pddelete.add_argument("--force", action="store_true", help="競合検知なしで削除 (非推奨)")
+    pddelete.set_defaults(func=cmd_data)
+
+    def add_compare_args(parser):
+        add_table_location(parser)
+        parser.add_argument("--target-profile", required=True)
+        parser.add_argument("--target-db", required=True)
+        parser.add_argument("--target-schema", default="public")
+        parser.add_argument("--target-table", help="既定: 比較元と同名")
+        parser.add_argument("--key", action="append", help="比較キー列 (複合キーは複数指定)")
+        parser.add_argument("--max-rows", type=int, default=dataedit_mod.DEFAULT_COMPARE_ROWS)
+
+    pdcompare = pdats.add_parser("compare", help="型互換テーブルを比較し適用計画を作成")
+    add_compare_args(pdcompare)
+    pdcompare.add_argument("--preview-rows", type=int, default=dataedit_mod.DEFAULT_PREVIEW_ROWS)
+    pdcompare.add_argument("--json", action="store_true")
+    pdcompare.set_defaults(func=cmd_data)
+
+    pdapply = pdats.add_parser("apply", help="比較済み plan_hash を merge/sync で適用")
+    add_compare_args(pdapply)
+    pdapply.add_argument("--strategy", choices=["merge", "sync"], required=True)
+    pdapply.add_argument("--plan-hash", required=True)
+    pdapply.add_argument("--confirm", required=True, help="compare が表示した確認文字列")
+    pdapply.set_defaults(func=cmd_data)
 
     # history
     ph = sub.add_parser("history", help="操作履歴の表示")

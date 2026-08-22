@@ -80,6 +80,13 @@
   .kpi { display: inline-block; background: #eef2f7; border-radius: 8px; padding: 8px 14px;
          margin: 0 8px 8px 0; }
   .kpi b { font-size: 17px; }
+  .data-cell { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .diff-add { background: #f0fdf4; }
+  .diff-change { background: #fffbeb; }
+  .diff-delete { background: #fef2f2; }
+  .field-row { display: grid; grid-template-columns: 150px 1fr 70px; gap: 8px;
+               align-items: center; margin: 7px 0; }
+  .field-row textarea, .field-row input, .field-row select { width: 100%; }
 </style>
 </head>
 <body>
@@ -91,6 +98,7 @@
   <button data-view="conn">接続</button>
   <button data-view="agents">バックアップエージェント</button>
   <button data-view="browse" class="active">データベース</button>
+  <button data-view="data">データ編集・比較</button>
   <button data-view="backup">バックアップ</button>
   <button data-view="versions">バージョン・リストア</button>
   <button data-view="history">履歴</button>
@@ -110,6 +118,15 @@
   <div class="row" style="justify-content:flex-end; margin-top:14px">
     <button class="secondary" onclick="document.getElementById('dlg-restore').close()">キャンセル</button>
     <button id="dlg-restore-go">リストア実行</button>
+  </div>
+</dialog>
+
+<dialog id="dlg-row" style="min-width:600px;max-width:900px">
+  <h2 id="dlg-row-title" style="margin-top:0">行の編集</h2>
+  <div id="dlg-row-fields"></div>
+  <div class="row" style="justify-content:flex-end;margin-top:14px">
+    <button class="secondary" id="dlg-row-cancel">キャンセル</button>
+    <button id="dlg-row-save">保存</button>
   </div>
 </dialog>
 
@@ -228,7 +245,7 @@ function renderJobs() {
 
 // ---------------------------------------------------------------- ビュー管理
 
-const state = { view: "browse", profiles: [], agents: [], browse: {}, backup: {}, versions: {}, agent: {} };
+const state = { view: "browse", profiles: [], agents: [], browse: {}, backup: {}, versions: {}, agent: {}, data: {} };
 
 async function loadProfiles() {
   state.profiles = await api("/api/profiles");
@@ -260,6 +277,7 @@ async function show(view) {
   if (view === "conn") renderConn(main);
   else if (view === "agents") renderAgents(main);
   else if (view === "browse") renderBrowse(main);
+  else if (view === "data") renderData(main);
   else if (view === "backup") renderBackup(main);
   else if (view === "versions") renderVersions(main);
   else if (view === "history") renderHistory(main);
@@ -588,6 +606,339 @@ function renderBrowse(main) {
       };
     } catch (e) { target.innerHTML = ""; toast(e.message, "err"); }
   }
+}
+
+// ---------------------------------------------------------------- データ編集・比較ビュー
+
+function renderData(main) {
+  const st = state.data;
+  st.limit = st.limit || 50;
+  st.offset = st.offset || 0;
+  main.innerHTML = `
+    <h2>データ編集</h2>
+    <div class="panel">
+      <div class="row">
+        <span>接続</span><select id="d-profile">${profileOptions(st.profile)}</select>
+        <span>DB</span><select id="d-db"></select>
+        <span>テーブル</span><select id="d-table" style="min-width:220px"></select>
+        <button id="d-load">行を表示</button>
+      </div>
+      <div class="muted">更新・削除は主キー、または全列 NOT NULL の一意キーがある実テーブルだけ利用できます。</div>
+    </div>
+    <div id="d-grid"></div>
+    <h2 style="margin-top:22px">テーブル比較・結合・上書き</h2>
+    <div class="panel">
+      <div class="muted" id="d-source-label">上で比較元テーブルを読み込んでください。</div>
+      <div class="form-grid" style="margin-top:10px;max-width:780px">
+        <span>比較先接続</span><select id="d-target-profile">${profileOptions(st.targetProfile)}</select>
+        <span>比較先 DB</span><select id="d-target-db"></select>
+        <span>比較先テーブル</span><select id="d-target-table"></select>
+        <span>比較キー</span><input id="d-keys" placeholder="例: id / 複合キーは id,tenant_id">
+        <span>比較上限</span><input id="d-max-rows" type="number" min="1" max="50000" value="${st.maxRows || 10000}">
+      </div>
+      <div class="row">
+        <button id="d-compare">差分をプレビュー</button>
+        <span class="muted">比較だけではデータを変更しません。適用時にも再比較・plan_hash検証を行います。</span>
+      </div>
+    </div>
+    <div id="d-compare-out"></div>`;
+
+  if (!state.profiles.length) {
+    $("#d-grid").innerHTML = `<div class="panel muted">先に「接続」タブでプロファイルを登録してください。</div>`;
+    return;
+  }
+
+  const tableValue = (schema, table) => JSON.stringify([schema, table]);
+  const parseTable = value => {
+    try { const pair = JSON.parse(value); return { schema: pair[0], table: pair[1] }; }
+    catch { throw new Error("テーブルを選択してください"); }
+  };
+  const compact = value => {
+    if (value === null) return "NULL";
+    if (typeof value === "object") return JSON.stringify(value);
+    return String(value);
+  };
+
+  async function loadDbs(profileSelect, dbSelect, preferred) {
+    const profile = $(profileSelect).value;
+    const rows = await api(`/api/databases?profile=${enc(profile)}`);
+    $(dbSelect).innerHTML = rows.map(row =>
+      `<option value="${esc(row.name)}" ${row.name === preferred ? "selected" : ""}>${esc(row.name)}</option>`).join("");
+    return rows;
+  }
+
+  async function loadTables(profileSelect, dbSelect, tableSelect, preferred) {
+    const profile = $(profileSelect).value, db = $(dbSelect).value;
+    if (!profile || !db) { $(tableSelect).innerHTML = ""; return []; }
+    const structure = await api(`/api/structure?profile=${enc(profile)}&db=${enc(db)}`);
+    const tables = structure.schemas.flatMap(schema => schema.tables
+      .filter(table => table.kind === "table" || table.kind === "partitioned table")
+      .map(table => ({ schema: schema.name, table: table.name })));
+    $(tableSelect).innerHTML = tables.map(item => {
+      const value = tableValue(item.schema, item.table);
+      return `<option value="${esc(value)}" ${value === preferred ? "selected" : ""}>` +
+        `${esc(item.schema)}.${esc(item.table)}</option>`;
+    }).join("");
+    return tables;
+  }
+
+  async function initSource() {
+    try {
+      const rows = await loadDbs("#d-profile", "#d-db", st.db);
+      if (rows.length) {
+        st.db = $("#d-db").value;
+        await loadTables("#d-profile", "#d-db", "#d-table",
+          st.schema && st.table ? tableValue(st.schema, st.table) : null);
+      }
+    } catch (error) { toast(error.message, "err"); }
+  }
+
+  async function initTarget() {
+    try {
+      const rows = await loadDbs("#d-target-profile", "#d-target-db", st.targetDb);
+      if (rows.length) {
+        st.targetDb = $("#d-target-db").value;
+        const preferred = st.targetSchema && st.targetTable
+          ? tableValue(st.targetSchema, st.targetTable)
+          : (st.schema && st.table ? tableValue(st.schema, st.table) : null);
+        await loadTables("#d-target-profile", "#d-target-db", "#d-target-table", preferred);
+      }
+    } catch (error) { toast(error.message, "err"); }
+  }
+
+  $("#d-profile").onchange = async () => {
+    st.profile = $("#d-profile").value; st.db = null; st.offset = 0;
+    await initSource();
+  };
+  $("#d-db").onchange = async () => {
+    st.db = $("#d-db").value; st.offset = 0;
+    await loadTables("#d-profile", "#d-db", "#d-table", null);
+  };
+  $("#d-target-profile").onchange = async () => {
+    st.targetProfile = $("#d-target-profile").value; st.targetDb = null;
+    await initTarget();
+  };
+  $("#d-target-db").onchange = async () => {
+    st.targetDb = $("#d-target-db").value;
+    await loadTables("#d-target-profile", "#d-target-db", "#d-target-table", null);
+  };
+  $("#d-load").onclick = e => withDisabled(e.target, () => loadRows(true));
+
+  async function loadRows(resetOffset) {
+    if (resetOffset) st.offset = 0;
+    st.profile = $("#d-profile").value;
+    st.db = $("#d-db").value;
+    const selected = parseTable($("#d-table").value);
+    st.schema = selected.schema; st.table = selected.table;
+    const out = $("#d-grid"); out.innerHTML = `<div class="panel muted">読み込み中…</div>`;
+    try {
+      const q = `profile=${enc(st.profile)}&db=${enc(st.db)}&schema=${enc(st.schema)}` +
+        `&table=${enc(st.table)}&limit=${st.limit}&offset=${st.offset}`;
+      st.page = await api(`/api/data/rows?${q}`);
+      renderGrid();
+      $("#d-source-label").innerHTML = `比較元: <b class="mono">${esc(st.profile)}:${esc(st.db)}/` +
+        `${esc(st.schema)}.${esc(st.table)}</b>`;
+      $("#d-keys").value = st.page.metadata.row_key.join(",");
+      await initTarget();
+    } catch (error) { out.innerHTML = ""; toast(error.message, "err"); }
+  }
+
+  function renderGrid() {
+    const page = st.page, meta = page.metadata, out = $("#d-grid");
+    const columns = meta.columns;
+    const totalLabel = page.total_approximate ? `約 ${page.total_rows}` : page.total_rows;
+    out.innerHTML = `<div class="panel">
+      <div class="row" style="justify-content:space-between">
+        <span><b class="mono">${esc(meta.schema)}.${esc(meta.table)}</b>
+          <span class="badge ${meta.row_key.length ? "ok" : "err"}">` +
+          `${meta.row_key.length ? "行キー: " + esc(meta.row_key.join(", ")) : "読み取り専用 (行キーなし)"}</span>
+          ${meta.row_security ? '<span class="badge mode">RLS 有効</span>' : ""}</span>
+        <button id="d-add" ${meta.can_insert ? "" : "disabled"}>＋ 行を追加</button>
+      </div>
+      <div class="scroll"><table><tr>
+        ${columns.map(column => `<th title="${esc(column.data_type)}">${esc(column.name)}<br>` +
+          `<span class="muted mono">${esc(column.data_type)}</span></th>`).join("")}
+        <th></th></tr>
+        ${page.rows.map((item, index) => `<tr>
+          ${columns.map(column => {
+            const value = item.values[column.name], text = compact(value);
+            return `<td class="data-cell ${value === null ? "muted" : ""}" title="${esc(text)}">${esc(text)}</td>`;
+          }).join("")}
+          <td style="white-space:nowrap">
+            <button class="small secondary" data-dedit="${index}" ${meta.can_update ? "" : "disabled"}>編集</button>
+            <button class="small danger" data-ddelete="${index}" ${meta.can_delete ? "" : "disabled"}>削除</button>
+          </td></tr>`).join("") || `<tr><td colspan="${columns.length + 1}" class="muted">データがありません。</td></tr>`}
+      </table></div>
+      <div class="row" style="justify-content:space-between">
+        <span class="muted">${page.rows.length ? page.offset + 1 : 0}〜${page.offset + page.rows.length} / ${totalLabel} 行</span>
+        <span><button class="small secondary" id="d-prev" ${page.offset <= 0 ? "disabled" : ""}>← 前</button>
+        <button class="small secondary" id="d-next" ${page.offset + page.rows.length >= page.total_rows ? "disabled" : ""}>次 →</button></span>
+      </div>
+    </div>`;
+    $("#d-add").onclick = () => openRowEditor("insert", null);
+    $$('[data-dedit]', out).forEach(button => button.onclick = () =>
+      openRowEditor("update", page.rows[Number(button.dataset.dedit)]));
+    $$('[data-ddelete]', out).forEach(button => button.onclick = async () => {
+      const item = page.rows[Number(button.dataset.ddelete)];
+      if (!confirm(`行 ${JSON.stringify(item.key)} を削除しますか?\nこの操作は元に戻せません。`)) return;
+      try {
+        await api("/api/data/delete", { body: {
+          profile: st.profile, db: st.db, schema_name: st.schema, table: st.table,
+          key: item.key, etag: item.etag,
+        }});
+        toast("行を削除しました"); await loadRows(false);
+      } catch (error) { toast(error.message, "err"); }
+    });
+    $("#d-prev").onclick = () => { st.offset = Math.max(0, st.offset - st.limit); loadRows(false); };
+    $("#d-next").onclick = () => { st.offset += st.limit; loadRows(false); };
+  }
+
+  function editorValue(value, column) {
+    if (value === null || value === undefined) return "";
+    if (column.type_family === "json" || column.type_family === "array" || typeof value === "object") {
+      return JSON.stringify(value, null, 2);
+    }
+    return String(value);
+  }
+
+  function parseEditorValue(text, column) {
+    if (column.type_family === "json" || column.type_family === "array") return JSON.parse(text);
+    if (column.type_family === "boolean") return text === "true";
+    return text;
+  }
+
+  function openRowEditor(mode, item) {
+    const meta = st.page.metadata;
+    const columns = meta.columns.filter(column => mode === "insert" ? column.insertable : column.updatable);
+    $("#dlg-row-title").textContent = mode === "insert"
+      ? `行を追加 — ${meta.schema}.${meta.table}` : `行を編集 — ${JSON.stringify(item.key)}`;
+    const fields = $("#dlg-row-fields");
+    fields.innerHTML = columns.map((column, index) => {
+      const value = item ? item.values[column.name] : null;
+      const defaultMode = mode === "insert"
+        ? ((!column.nullable && column.default == null && !column.identity) ? "value" : "omit")
+        : (value === null ? "null" : "value");
+      const input = column.type_family === "boolean"
+        ? `<select class="d-field-value"><option value="true">true</option><option value="false" ` +
+          `${value === false ? "selected" : ""}>false</option></select>`
+        : (column.type_family === "json" || column.type_family === "array")
+          ? `<textarea class="d-field-value" rows="3">${esc(editorValue(value, column))}</textarea>`
+          : `<input class="d-field-value mono" value="${esc(editorValue(value, column))}" ` +
+            `placeholder="${esc(column.data_type)}">`;
+      return `<div class="field-row" data-field="${index}">
+        <span><b>${esc(column.name)}</b><br><span class="muted mono">${esc(column.data_type)}</span></span>
+        ${input}
+        <select class="d-field-mode">
+          <option value="value" ${defaultMode === "value" ? "selected" : ""}>値</option>
+          ${column.nullable ? `<option value="null" ${defaultMode === "null" ? "selected" : ""}>NULL</option>` : ""}
+          ${mode === "insert" ? `<option value="omit" ${defaultMode === "omit" ? "selected" : ""}>省略</option>` : ""}
+        </select></div>`;
+    }).join("") || `<div class="muted">入力可能な列がありません。</div>`;
+    $$('.d-field-mode', fields).forEach(select => {
+      const sync = () => { $('.d-field-value', select.closest('.field-row')).disabled = select.value !== 'value'; };
+      select.onchange = sync; sync();
+    });
+    const dlg = $("#dlg-row");
+    $("#dlg-row-cancel").onclick = () => dlg.close();
+    $("#dlg-row-save").onclick = event => withDisabled(event.target, async () => {
+      try {
+        const values = {};
+        columns.forEach((column, index) => {
+          const row = $(`[data-field="${index}"]`, fields);
+          const fieldMode = $('.d-field-mode', row).value;
+          if (fieldMode === "omit") return;
+          values[column.name] = fieldMode === "null" ? null
+            : parseEditorValue($('.d-field-value', row).value, column);
+        });
+        const body = {
+          profile: st.profile, db: st.db, schema_name: st.schema, table: st.table, values,
+        };
+        if (mode === "update") { body.key = item.key; body.etag = item.etag; }
+        await api(`/api/data/${mode}`, { body });
+        dlg.close(); toast(mode === "insert" ? "行を追加しました" : "行を更新しました");
+        await loadRows(false);
+      } catch (error) { toast(error.message, "err"); }
+    });
+    dlg.showModal();
+  }
+
+  function compareBody() {
+    if (!st.page) throw new Error("先に比較元テーブルを読み込んでください");
+    const target = parseTable($("#d-target-table").value);
+    st.targetProfile = $("#d-target-profile").value;
+    st.targetDb = $("#d-target-db").value;
+    st.targetSchema = target.schema; st.targetTable = target.table;
+    st.maxRows = Number($("#d-max-rows").value);
+    const keys = $("#d-keys").value.split(",").map(value => value.trim()).filter(Boolean);
+    return {
+      source_profile: st.profile, source_db: st.db, source_schema: st.schema, source_table: st.table,
+      target_profile: st.targetProfile, target_db: st.targetDb,
+      target_schema: st.targetSchema, target_table: st.targetTable,
+      key_columns: keys.length ? keys : null, max_rows: st.maxRows, preview_rows: 100,
+    };
+  }
+
+  $("#d-compare").onclick = event => withDisabled(event.target, async () => {
+    const out = $("#d-compare-out"); out.innerHTML = `<div class="panel muted">比較中…</div>`;
+    try {
+      st.compareBody = compareBody();
+      st.plan = await api("/api/data/compare", { body: st.compareBody });
+      renderPlan();
+    } catch (error) { out.innerHTML = ""; toast(error.message, "err"); }
+  });
+
+  function renderPlan() {
+    const plan = st.plan, summary = plan.summary, out = $("#d-compare-out");
+    const keyText = item => esc(JSON.stringify(item.key));
+    out.innerHTML = `<div class="panel">
+      <h3 style="margin-top:0">差分プレビュー</h3>
+      <span class="kpi">追加 <b>${summary.only_source}</b></span>
+      <span class="kpi">更新 <b>${summary.changed}</b></span>
+      <span class="kpi">削除候補(syncのみ) <b>${summary.only_target}</b></span>
+      <span class="kpi">同一 <b>${summary.same}</b></span>
+      ${plan.warnings.map(warning => `<div style="color:var(--warn)">⚠ ${esc(warning)}</div>`).join("")}
+      <div class="muted mono" style="margin:8px 0">plan_hash: ${esc(plan.plan_hash)}</div>
+      <div class="scroll"><table>
+        <tr><th>種別</th><th>キー</th><th>差分</th></tr>
+        ${plan.preview.only_source.map(item => `<tr class="diff-add"><td>追加</td><td class="mono">${keyText(item)}</td>` +
+          `<td class="mono">${esc(JSON.stringify(item.row))}</td></tr>`).join("")}
+        ${plan.preview.changed.map(item => `<tr class="diff-change"><td>更新</td><td class="mono">${keyText(item)}</td>` +
+          `<td>${esc(item.columns.join(", "))}<br><span class="muted mono">元: ${esc(JSON.stringify(item.source))}` +
+          `<br>先: ${esc(JSON.stringify(item.target))}</span></td></tr>`).join("")}
+        ${plan.preview.only_target.map(item => `<tr class="diff-delete"><td>削除候補</td><td class="mono">${keyText(item)}</td>` +
+          `<td class="mono">${esc(JSON.stringify(item.row))}</td></tr>`).join("")}
+        ${summary.only_source + summary.changed + summary.only_target === 0
+          ? '<tr><td colspan="3" class="muted">差分はありません。</td></tr>' : ""}
+      </table></div>
+      <div class="row" style="margin-top:12px">
+        <button id="d-merge" ${summary.only_source + summary.changed ? "" : "disabled"}>merge (追加＋更新)</button>
+        <button id="d-sync" class="danger" ${summary.only_source + summary.changed + summary.only_target ? "" : "disabled"}>sync (完全同期)</button>
+        <span class="muted">sync は比較先だけにある行も削除します。</span>
+      </div>
+    </div>`;
+    $("#d-merge").onclick = event => applyPlan("merge", event.target);
+    $("#d-sync").onclick = event => applyPlan("sync", event.target);
+  }
+
+  async function applyPlan(strategy, button) {
+    if (strategy === "sync" && !confirm("sync は比較先だけにある行を削除します。続行しますか?")) return;
+    const typed = prompt(`実行するには次の確認文字列を入力してください:\n${st.plan.confirmation}`);
+    if (typed !== st.plan.confirmation) { toast("確認文字列が一致しません", "err"); return; }
+    await withDisabled(button, async () => {
+      try {
+        const response = await api("/api/data/apply", { body: {
+          ...st.compareBody, strategy, plan_hash: st.plan.plan_hash, confirmation: typed,
+        }});
+        watchJob(response.job_id, async job => {
+          toast(`${strategy} 完了: insert=${job.result.inserted}, update=${job.result.updated}, delete=${job.result.deleted}`);
+          st.plan = null; $("#d-compare-out").innerHTML = ""; await loadRows(false);
+        });
+      } catch (error) { toast(error.message, "err"); }
+    });
+  }
+
+  initSource();
+  initTarget();
 }
 
 // ---------------------------------------------------------------- バックアップビュー

@@ -38,6 +38,21 @@ node bin/pgbackup.js restore local/shop_db@v1 --dest remote --db shop_db_restore
 node bin/pgbackup.js web                                              # Web UI (http://127.0.0.1:8501)
 ```
 
+行編集・比較・merge/syncもPython版と同じです:
+
+```bash
+node bin/pgbackup.js data rows local shop_db customers --limit 20 --json
+node bin/pgbackup.js data compare local shop_db edit_source \
+  --target-profile local --target-db shop_db --target-table edit_target --json
+node bin/pgbackup.js data apply local shop_db edit_source \
+  --target-profile local --target-db shop_db --target-table edit_target \
+  --strategy merge --plan-hash PLAN_HASH \
+  --confirm 'local@localhost:5432/shop_db/public.edit_target'
+```
+
+行キー、ETag、型互換、`plan_hash`、merge/syncの安全条件は
+[ルートREADMEのデータ編集節](../README.md#データ編集テーブル比較mergesync)を参照してください。
+
 ### HTTPS バックアップエージェント
 
 エージェントサーバーの初期化・起動はPython版の `pgbackup agent init / serve` を使います。
@@ -68,6 +83,7 @@ nodejs/
 │   ├── db.js            # pg 接続・CREATE/DROP/RENAME DATABASE・クラスタ同一性判定
 │   ├── pgtools.js       # pg_dump / pg_restore / psql の検出と実行、パイプ複製
 │   ├── inspect.js       # DB 一覧・構造・データ型内訳・サンプル取得
+│   ├── dataedit.js      # 型対応CRUD・ETag・テーブル比較・merge/sync
 │   ├── catalog.js       # バージョンカタログ (node:sqlite、Python 版とスキーマ互換)
 │   ├── archive.js       # BACK_UP_DB への格納 (16MB チャンク bytea + sha256)
 │   ├── agent.js         # Python版エージェント互換 HTTPS クライアント

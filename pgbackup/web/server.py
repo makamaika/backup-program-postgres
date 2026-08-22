@@ -22,6 +22,7 @@ from pydantic import BaseModel
 from .. import archive as archive_mod
 from .. import backup as backup_mod
 from .. import config
+from .. import dataedit as dataedit_mod
 from .. import inspect as inspect_mod
 from .. import restore as restore_mod
 from ..agent.client import AgentClient
@@ -170,6 +171,50 @@ class AgentRemoteRestoreIn(BaseModel):
     db: str | None = None
     drop: bool = False
     keep_owner: bool = False
+
+
+class DataInsertIn(BaseModel):
+    profile: str
+    db: str
+    schema_name: str = "public"
+    table: str
+    values: dict
+
+
+class DataUpdateIn(DataInsertIn):
+    key: dict
+    etag: str | None = None
+    force: bool = False
+
+
+class DataDeleteIn(BaseModel):
+    profile: str
+    db: str
+    schema_name: str = "public"
+    table: str
+    key: dict
+    etag: str | None = None
+    force: bool = False
+
+
+class DataCompareIn(BaseModel):
+    source_profile: str
+    source_db: str
+    source_schema: str = "public"
+    source_table: str
+    target_profile: str
+    target_db: str
+    target_schema: str = "public"
+    target_table: str
+    key_columns: list[str] | None = None
+    max_rows: int = dataedit_mod.DEFAULT_COMPARE_ROWS
+    preview_rows: int = dataedit_mod.DEFAULT_PREVIEW_ROWS
+
+
+class DataApplyIn(DataCompareIn):
+    strategy: str
+    plan_hash: str
+    confirmation: str
 
 
 # ---------------------------------------------------------------- アプリ本体
@@ -344,6 +389,111 @@ def create_app() -> FastAPI:
     @app.get("/api/sample")
     def table_sample(profile: str, db: str, schema: str, table: str, limit: int = 10):
         return inspect_mod.table_sample(store.get(profile), db, schema, table, limit)
+
+    # ---- 行編集・テーブル比較 / merge / sync ----
+
+    @app.get("/api/data/rows")
+    def data_rows(
+        profile: str,
+        db: str,
+        schema: str,
+        table: str,
+        limit: int = dataedit_mod.DEFAULT_PAGE_SIZE,
+        offset: int = 0,
+        order_by: str | None = None,
+        direction: str = "asc",
+    ):
+        return dataedit_mod.read_rows(
+            store.get(profile), db, schema, table,
+            limit=limit, offset=offset, order_by=order_by, direction=direction,
+        )
+
+    @app.post("/api/data/insert")
+    def data_insert(body: DataInsertIn):
+        result = dataedit_mod.insert_row(
+            store.get(body.profile), body.db, body.schema_name, body.table, body.values
+        )
+        catalog.log_operation(
+            "data-insert", True,
+            f"行追加: {body.profile}:{body.db}/{body.schema_name}.{body.table}",
+            {"key": result["key"]},
+        )
+        return result
+
+    @app.post("/api/data/update")
+    def data_update(body: DataUpdateIn):
+        result = dataedit_mod.update_row(
+            store.get(body.profile), body.db, body.schema_name, body.table,
+            body.key, body.values, etag=body.etag, force=body.force,
+        )
+        catalog.log_operation(
+            "data-update", True,
+            f"行更新: {body.profile}:{body.db}/{body.schema_name}.{body.table}",
+            {"key": result["key"]},
+        )
+        return result
+
+    @app.post("/api/data/delete")
+    def data_delete(body: DataDeleteIn):
+        result = dataedit_mod.delete_row(
+            store.get(body.profile), body.db, body.schema_name, body.table,
+            body.key, etag=body.etag, force=body.force,
+        )
+        catalog.log_operation(
+            "data-delete", True,
+            f"行削除: {body.profile}:{body.db}/{body.schema_name}.{body.table}",
+            {"key": result["key"]},
+        )
+        return result
+
+    @app.post("/api/data/compare")
+    def data_compare(body: DataCompareIn):
+        return dataedit_mod.compare_tables(
+            store.get(body.source_profile), body.source_db,
+            body.source_schema, body.source_table,
+            store.get(body.target_profile), body.target_db,
+            body.target_schema, body.target_table,
+            key_columns=body.key_columns,
+            max_rows=body.max_rows,
+            preview_rows=body.preview_rows,
+        )
+
+    @app.post("/api/data/apply")
+    def data_apply(body: DataApplyIn):
+        source = store.get(body.source_profile)
+        target = store.get(body.target_profile)
+
+        def run(log):
+            log("比較元・比較先を再検証し、対象テーブルをロックしています")
+            result = dataedit_mod.apply_table_plan(
+                source, body.source_db, body.source_schema, body.source_table,
+                target, body.target_db, body.target_schema, body.target_table,
+                strategy=body.strategy,
+                expected_plan_hash=body.plan_hash,
+                confirmation=body.confirmation,
+                key_columns=body.key_columns,
+                max_rows=body.max_rows,
+            )
+            catalog.log_operation(
+                f"data-{body.strategy}", True,
+                f"{body.strategy}: {body.source_profile}:{body.source_db}/"
+                f"{body.source_schema}.{body.source_table} -> "
+                f"{body.target_profile}:{body.target_db}/{body.target_schema}.{body.target_table}",
+                result,
+            )
+            log(
+                f"完了: insert={result['inserted']}, update={result['updated']}, "
+                f"delete={result['deleted']}"
+            )
+            return result
+
+        return {
+            "job_id": jobs.submit(
+                f"data-{body.strategy}",
+                f"{body.strategy}: {body.source_table} -> {body.target_table}",
+                run,
+            )
+        }
 
     # ---- バックアップ / リストア (ジョブ) ----
 

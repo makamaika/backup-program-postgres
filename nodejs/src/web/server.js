@@ -13,6 +13,7 @@ import express from "express";
 import * as archiveMod from "../archive.js";
 import { AgentClient } from "../agent.js";
 import * as backupMod from "../backup.js";
+import * as dataeditMod from "../dataedit.js";
 import * as inspectMod from "../inspect.js";
 import * as restoreMod from "../restore.js";
 import { Catalog } from "../catalog.js";
@@ -240,6 +241,98 @@ export function createApp() {
       profile, requireQ(req, "db"), requireQ(req, "schema"), requireQ(req, "table"),
       limitQ(req, 10, 200)
     ));
+  });
+
+  // ---- 行編集・テーブル比較 / merge / sync ----
+
+  app.get("/api/data/rows", async (req, res) => {
+    res.json(await dataeditMod.readRows(
+      store.get(requireQ(req, "profile")), requireQ(req, "db"),
+      requireQ(req, "schema"), requireQ(req, "table"),
+      {
+        limit: limitQ(req, dataeditMod.DEFAULT_PAGE_SIZE, dataeditMod.MAX_PAGE_SIZE),
+        offset: Number(optQ(req, "offset") ?? 0),
+        orderBy: optQ(req, "order_by"),
+        direction: optQ(req, "direction") ?? "asc",
+      }
+    ));
+  });
+
+  app.post("/api/data/insert", async (req, res) => {
+    const b = req.body ?? {};
+    const result = await dataeditMod.insertRow(
+      store.get(String(b.profile ?? "")), String(b.db ?? ""),
+      String(b.schema_name ?? "public"), String(b.table ?? ""), b.values ?? {}
+    );
+    catalog.logOperation("data-insert", true,
+      `行追加: ${b.profile}:${b.db}/${b.schema_name || "public"}.${b.table}`, { key: result.key });
+    res.json(result);
+  });
+
+  app.post("/api/data/update", async (req, res) => {
+    const b = req.body ?? {};
+    const result = await dataeditMod.updateRow(
+      store.get(String(b.profile ?? "")), String(b.db ?? ""),
+      String(b.schema_name ?? "public"), String(b.table ?? ""), b.key ?? {}, b.values ?? {},
+      { etag: b.etag ?? null, force: Boolean(b.force) }
+    );
+    catalog.logOperation("data-update", true,
+      `行更新: ${b.profile}:${b.db}/${b.schema_name || "public"}.${b.table}`, { key: result.key });
+    res.json(result);
+  });
+
+  app.post("/api/data/delete", async (req, res) => {
+    const b = req.body ?? {};
+    const result = await dataeditMod.deleteRow(
+      store.get(String(b.profile ?? "")), String(b.db ?? ""),
+      String(b.schema_name ?? "public"), String(b.table ?? ""), b.key ?? {},
+      { etag: b.etag ?? null, force: Boolean(b.force) }
+    );
+    catalog.logOperation("data-delete", true,
+      `行削除: ${b.profile}:${b.db}/${b.schema_name || "public"}.${b.table}`, { key: result.key });
+    res.json(result);
+  });
+
+  app.post("/api/data/compare", async (req, res) => {
+    const b = req.body ?? {};
+    res.json(await dataeditMod.compareTables(
+      store.get(String(b.source_profile ?? "")), String(b.source_db ?? ""),
+      String(b.source_schema ?? "public"), String(b.source_table ?? ""),
+      store.get(String(b.target_profile ?? "")), String(b.target_db ?? ""),
+      String(b.target_schema ?? "public"), String(b.target_table ?? ""),
+      {
+        keyColumns: Array.isArray(b.key_columns) && b.key_columns.length ? b.key_columns : null,
+        maxRows: Number(b.max_rows ?? dataeditMod.DEFAULT_COMPARE_ROWS),
+        previewRows: Number(b.preview_rows ?? dataeditMod.DEFAULT_PREVIEW_ROWS),
+      }
+    ));
+  });
+
+  app.post("/api/data/apply", (req, res) => {
+    const b = req.body ?? {};
+    const source = store.get(String(b.source_profile ?? ""));
+    const target = store.get(String(b.target_profile ?? ""));
+    const run = async (log) => {
+      log("比較元・比較先を再検証し、対象テーブルをロックしています");
+      const result = await dataeditMod.applyTablePlan(
+        source, String(b.source_db ?? ""), String(b.source_schema ?? "public"), String(b.source_table ?? ""),
+        target, String(b.target_db ?? ""), String(b.target_schema ?? "public"), String(b.target_table ?? ""),
+        {
+          strategy: String(b.strategy ?? ""), expectedPlanHash: String(b.plan_hash ?? ""),
+          confirmation: String(b.confirmation ?? ""),
+          keyColumns: Array.isArray(b.key_columns) && b.key_columns.length ? b.key_columns : null,
+          maxRows: Number(b.max_rows ?? dataeditMod.DEFAULT_COMPARE_ROWS),
+        }
+      );
+      catalog.logOperation(`data-${b.strategy}`, true,
+        `${b.strategy}: ${b.source_profile}:${b.source_db}/${b.source_schema}.${b.source_table} -> ` +
+        `${b.target_profile}:${b.target_db}/${b.target_schema}.${b.target_table}`, result);
+      log(`完了: insert=${result.inserted}, update=${result.updated}, delete=${result.deleted}`);
+      return result;
+    };
+    res.json({
+      job_id: jobs.submit(`data-${b.strategy}`, `${b.strategy}: ${b.source_table} -> ${b.target_table}`, run),
+    });
   });
 
   // ---- バックアップ / リストア (ジョブ) ----

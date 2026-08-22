@@ -23,3 +23,7 @@ class RestoreError(PgBackupError):
 
 class AgentError(PgBackupError):
     """バックアップエージェントの設定・通信・保存処理の失敗。"""
+
+
+class DataEditError(PgBackupError):
+    """行編集・テーブル比較・同期処理の失敗。"""

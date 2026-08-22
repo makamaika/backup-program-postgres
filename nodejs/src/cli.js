@@ -18,6 +18,7 @@ import { Command, InvalidArgumentError } from "commander";
 import * as archiveMod from "./archive.js";
 import { AgentClient } from "./agent.js";
 import * as backupMod from "./backup.js";
+import * as dataeditMod from "./dataedit.js";
 import * as inspectMod from "./inspect.js";
 import * as restoreMod from "./restore.js";
 import { Catalog } from "./catalog.js";
@@ -115,6 +116,20 @@ function intArg(label, min, max) {
 
 function collect(value, previous) {
   return previous.concat([value]);
+}
+
+function jsonObject(text, label) {
+  let value;
+  try { value = JSON.parse(text); }
+  catch (error) { throw new PgBackupError(`${label} は有効な JSON オブジェクトで指定してください: ${error.message}`); }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new PgBackupError(`${label} は JSON オブジェクトで指定してください`);
+  }
+  return value;
+}
+
+function printJson(value) {
+  console.log(JSON.stringify(value, null, 2));
 }
 
 // ---------------------------------------------------------------- コマンド本体
@@ -441,6 +456,122 @@ export async function main(argv) {
         destDb: opts.db ?? null, drop: Boolean(opts.drop), keepOwner: Boolean(opts.keepOwner),
       });
       console.log(`エージェント側リストア完了: ${name}:${backupId} -> ${opts.remoteProfile}:${rec.dest_db}`);
+    });
+
+  // ---- data editor / compare / merge ----
+  const dataCmd = program.command("data").description("行の編集・テーブル比較・merge/sync");
+  const addLocation = (command) => command
+    .argument("<profile>").argument("<db>").argument("<table>")
+    .option("--schema <schema>", "スキーマ", "public");
+
+  addLocation(dataCmd.command("rows").description("テーブルの行をページ表示"))
+    .option("--limit <n>", "行数", intArg("limit", 1, dataeditMod.MAX_PAGE_SIZE), dataeditMod.DEFAULT_PAGE_SIZE)
+    .option("--offset <n>", "開始位置", intArg("offset", 0, Number.MAX_SAFE_INTEGER), 0)
+    .option("--order-by <column>")
+    .option("--direction <direction>", "asc | desc", "asc")
+    .option("--json")
+    .action(async (profileName, db, table, opts) => {
+      const result = await dataeditMod.readRows(store.get(profileName), db, opts.schema, table, {
+        limit: opts.limit, offset: opts.offset, orderBy: opts.orderBy ?? null, direction: opts.direction,
+      });
+      if (opts.json) { printJson(result); return; }
+      const columns = result.metadata.columns.map((column) => column.name);
+      const rows = result.rows.map((item) => ({ ...item.values, _etag: item.etag }));
+      printTable(rows, [...columns.map((name) => [name, name]), ["_etag", "etag"]]);
+      console.log(`${result.offset + 1}〜${result.offset + rows.length} / ${result.total_rows}` +
+        (result.total_approximate ? " (推定) 行" : " 行"));
+      if (!result.metadata.row_key.length) console.log("注意: 行キーがないため読み取り専用です");
+    });
+
+  addLocation(dataCmd.command("insert").description("1 行追加"))
+    .requiredOption("--values <json>")
+    .action(async (profileName, db, table, opts) => {
+      const result = await dataeditMod.insertRow(
+        store.get(profileName), db, opts.schema, table, jsonObject(opts.values, "--values")
+      );
+      catalog.logOperation("data-insert", true, `行追加: ${profileName}:${db}/${opts.schema}.${table}`,
+        { key: result.key });
+      printJson(result);
+    });
+
+  addLocation(dataCmd.command("update").description("行キーで 1 行更新"))
+    .requiredOption("--key <json>")
+    .requiredOption("--values <json>")
+    .option("--etag <etag>")
+    .option("--force", "競合検知なしで更新 (非推奨)")
+    .action(async (profileName, db, table, opts) => {
+      const result = await dataeditMod.updateRow(
+        store.get(profileName), db, opts.schema, table,
+        jsonObject(opts.key, "--key"), jsonObject(opts.values, "--values"),
+        { etag: opts.etag ?? null, force: Boolean(opts.force) }
+      );
+      catalog.logOperation("data-update", true, `行更新: ${profileName}:${db}/${opts.schema}.${table}`,
+        { key: result.key });
+      printJson(result);
+    });
+
+  addLocation(dataCmd.command("delete").description("行キーで 1 行削除"))
+    .requiredOption("--key <json>")
+    .option("--etag <etag>")
+    .option("--force", "競合検知なしで削除 (非推奨)")
+    .action(async (profileName, db, table, opts) => {
+      const result = await dataeditMod.deleteRow(
+        store.get(profileName), db, opts.schema, table, jsonObject(opts.key, "--key"),
+        { etag: opts.etag ?? null, force: Boolean(opts.force) }
+      );
+      catalog.logOperation("data-delete", true, `行削除: ${profileName}:${db}/${opts.schema}.${table}`,
+        { key: result.key });
+      printJson(result);
+    });
+
+  const addCompareOptions = (command) => addLocation(command)
+    .requiredOption("--target-profile <profile>")
+    .requiredOption("--target-db <db>")
+    .option("--target-schema <schema>", "対象スキーマ", "public")
+    .option("--target-table <table>", "既定: 比較元と同名")
+    .option("--key <column>", "比較キー列 (複数指定可)", collect, [])
+    .option("--max-rows <n>", "比較上限", intArg("max-rows", 1, dataeditMod.MAX_COMPARE_ROWS),
+      dataeditMod.DEFAULT_COMPARE_ROWS);
+
+  addCompareOptions(dataCmd.command("compare").description("型互換テーブルを比較し適用計画を作成"))
+    .option("--preview-rows <n>", "差分プレビュー数",
+      intArg("preview-rows", 1, dataeditMod.MAX_PREVIEW_ROWS), dataeditMod.DEFAULT_PREVIEW_ROWS)
+    .option("--json")
+    .action(async (profileName, db, table, opts) => {
+      const result = await dataeditMod.compareTables(
+        store.get(profileName), db, opts.schema, table,
+        store.get(opts.targetProfile), opts.targetDb, opts.targetSchema, opts.targetTable || table,
+        { keyColumns: opts.key.length ? opts.key : null, maxRows: opts.maxRows, previewRows: opts.previewRows }
+      );
+      if (opts.json) { printJson(result); return; }
+      printTable([result.summary], [
+        ["source_rows", "元行数"], ["target_rows", "先行数"], ["only_source", "追加候補"],
+        ["changed", "更新候補"], ["only_target", "削除候補(sync)"], ["same", "同一"],
+      ]);
+      for (const warning of result.warnings) console.log(`警告: ${warning}`);
+      console.log(`plan_hash: ${result.plan_hash}`);
+      console.log(`確認文字列: ${result.confirmation}`);
+      console.log("適用前に --json で差分詳細も確認してください");
+    });
+
+  addCompareOptions(dataCmd.command("apply").description("比較済み plan_hash を merge/sync で適用"))
+    .requiredOption("--strategy <strategy>", "merge | sync")
+    .requiredOption("--plan-hash <hash>")
+    .requiredOption("--confirm <text>")
+    .action(async (profileName, db, table, opts) => {
+      const targetTable = opts.targetTable || table;
+      const result = await dataeditMod.applyTablePlan(
+        store.get(profileName), db, opts.schema, table,
+        store.get(opts.targetProfile), opts.targetDb, opts.targetSchema, targetTable,
+        {
+          strategy: opts.strategy, expectedPlanHash: opts.planHash, confirmation: opts.confirm,
+          keyColumns: opts.key.length ? opts.key : null, maxRows: opts.maxRows,
+        }
+      );
+      catalog.logOperation(`data-${opts.strategy}`, true,
+        `${opts.strategy}: ${profileName}:${db}/${opts.schema}.${table} -> ` +
+        `${opts.targetProfile}:${opts.targetDb}/${opts.targetSchema}.${targetTable}`, result);
+      printJson(result);
     });
   arch
     .command("restore <profile> <versionId>")

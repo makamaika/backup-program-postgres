@@ -12,6 +12,14 @@ import { PgBackupError } from "./errors.js";
 
 const { Client } = pg;
 
+const RAW_TEMPORAL_OIDS = new Set([1082, 1083, 1114, 1184, 1186, 1266]);
+const typeOverrides = {
+  getTypeParser(oid, format) {
+    if (format === "text" && RAW_TEMPORAL_OIDS.has(Number(oid))) return (value) => value;
+    return pg.types.getTypeParser(oid, format);
+  },
+};
+
 export const CONNECT_TIMEOUT_MS = 10_000;
 
 // SQL 識別子 (DB 名等) のクオート
@@ -52,10 +60,12 @@ export async function connect(profile, dbname = null) {
       password: profile.password ?? undefined, // 未設定なら PGPASSWORD 環境変数等に委ねる
       database: dbname || profile.dbname,
       connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
+      types: typeOverrides,
       ssl: attempts[i] === false ? undefined : attempts[i],
     });
     try {
       await client.connect();
+      await client.query("SET TIME ZONE 'UTC'");
       return client;
     } catch (e) {
       lastErr = e;
