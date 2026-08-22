@@ -19,10 +19,19 @@ import getpass
 import json
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 from . import __version__, backup as backup_mod, inspect as inspect_mod, restore as restore_mod
 from . import archive as archive_mod
 from . import config
+from .agent.client import AgentClient
+from .agent.config import (
+    AgentProfileStore,
+    AgentServerConfig,
+    current_server_fingerprint,
+    initialize_server,
+)
+from .agent.server import run_agent_server
 from .catalog import Catalog
 from .config import DEFAULT_ARCHIVE_DB, Profile, ProfileStore, home_dir
 from .db import server_version
@@ -128,7 +137,7 @@ def cmd_backup(args, store: ProfileStore, catalog: Catalog) -> int:
     dbs = backup_mod.resolve_target_dbs(source, args.db, all_dbs=args.all, archive_db=archive_db)
     fmt = backup_mod.check_mode_options(
         args.mode, fmt=args.fmt, out=args.out, dest=args.dest, dest_db=args.dest_db,
-        drop=args.drop, keep_owner=args.keep_owner, n_dbs=len(dbs),
+        agent=args.agent, drop=args.drop, keep_owner=args.keep_owner, n_dbs=len(dbs),
     )
 
     if args.mode == "clone":
@@ -148,6 +157,22 @@ def cmd_backup(args, store: ProfileStore, catalog: Catalog) -> int:
             )
             print(f"アーカイブ保存: {rec['version_id']} -> {dest.name}:{archive_db} "
                   f"({_size_fmt(rec['size'])})")
+    elif args.mode == "agent":
+        agent = AgentProfileStore().get(args.agent)
+        for db in dbs:
+            rec = backup_mod.backup_to_agent(
+                catalog,
+                source,
+                db,
+                agent,
+                fmt=fmt,
+                note=args.note,
+                keep_owner=args.keep_owner,
+            )
+            print(
+                f"エージェント保存: {rec['version_id']} -> "
+                f"{agent.name}:{rec['agent_backup_id']} ({_size_fmt(rec['size'])})"
+            )
     else:  # file
         for db in dbs:
             rec = backup_mod.backup_to_file(
@@ -164,7 +189,12 @@ def cmd_versions(args, store: ProfileStore, catalog: Catalog) -> int:
     rows = catalog.list_backups(profile=args.profile, db=args.db)
     for r in rows:
         r["size_h"] = _size_fmt(r["size"])
-        r["place"] = r["location"] if r["mode"] == "file" else f"{r['archive_profile']}:{r['archive_db']}"
+        if r["mode"] == "file":
+            r["place"] = r["location"]
+        elif r["mode"] == "archive":
+            r["place"] = f"{r['archive_profile']}:{r['archive_db']}"
+        else:
+            r["place"] = f"{r['agent_profile']}:{r['agent_backup_id']}"
     _print_table(rows, [("version_id", "バージョン"), ("mode", "モード"), ("fmt", "形式"),
                         ("size_h", "サイズ"), ("created_at", "作成日時 (UTC)"), ("place", "保存先"),
                         ("note", "メモ")])
@@ -236,7 +266,149 @@ def cmd_web(args, store: ProfileStore, catalog: Catalog) -> int:
     from .web.server import create_app
 
     print(f"Web UI: http://{args.host}:{args.port}/  (Ctrl+C で終了)")
-    uvicorn.run(create_app(), host=args.host, port=args.port, log_level="warning")
+    uvicorn.run(
+        create_app(), host=args.host, port=args.port, log_level="warning", server_header=False
+    )
+    return 0
+
+
+def cmd_agent(args, store: ProfileStore, catalog: Catalog) -> int:
+    agents = AgentProfileStore()
+    if args.agent_cmd == "init":
+        if args.max_upload_gib <= 0:
+            raise PgBackupError("--max-upload-gib は 0 より大きい値を指定してください")
+        if args.max_storage_gib <= 0:
+            raise PgBackupError("--max-storage-gib は 0 より大きい値を指定してください")
+        server, pairing_path, fingerprint = initialize_server(
+            name=args.name,
+            public_url=args.public_url,
+            pairing_out=Path(args.pairing_out) if args.pairing_out else None,
+            storage_dir=Path(args.storage_dir) if args.storage_dir else None,
+            max_upload_bytes=int(args.max_upload_gib * 1024**3),
+            max_storage_bytes=int(args.max_storage_gib * 1024**3),
+            allow_db_read=args.allow_db_read,
+            allow_db_restore=args.allow_db_restore,
+            overwrite=args.overwrite,
+        )
+        print(f"エージェントを初期化しました: {server.name} ({server.public_url})")
+        print(f"  pairing bundle: {pairing_path}")
+        print(f"  証明書 SHA-256: {fingerprint}")
+        print("  pairing bundle には秘密トークンが入っています。登録後は安全に削除してください。")
+        print("  起動: pgbackup agent serve --host 0.0.0.0")
+    elif args.agent_cmd == "serve":
+        server = AgentServerConfig.load(Path(args.config) if args.config else None)
+        parsed = urlparse(server.public_url)
+        port = args.port or parsed.port or 443
+        print(f"HTTPS エージェント: {server.public_url} (Ctrl+C で終了)")
+        print(f"  listen: {args.host}:{port}")
+        print(f"  capabilities: {', '.join(server.capabilities)}")
+        print(f"  cert SHA-256: {current_server_fingerprint(server)}")
+        run_agent_server(server, host=args.host, port=port)
+    elif args.agent_cmd == "add":
+        profile = agents.add_pairing_file(
+            Path(args.pairing_file), name=args.name, overwrite=args.overwrite
+        )
+        print(f"エージェント '{profile.name}' を登録しました ({profile.url})")
+        print(f"  保存先: {agents.path} (秘密トークンを含むため取り扱いに注意)")
+    elif args.agent_cmd == "list":
+        _print_table(
+            [profile.to_dict(mask_token=True) for profile in agents.list()],
+            [("name", "名前"), ("url", "URL"), ("token", "トークン")],
+        )
+    elif args.agent_cmd == "remove":
+        agents.remove(args.name)
+        print(f"エージェント '{args.name}' を削除しました")
+    elif args.agent_cmd == "test":
+        profile = agents.get(args.name)
+        health = AgentClient(profile).health()
+        print(
+            f"OK: {profile.url} / {health['name']} / "
+            f"capabilities={','.join(health.get('capabilities', []))}"
+        )
+    elif args.agent_cmd == "backups":
+        rows = AgentClient(agents.get(args.name)).list_backups(limit=args.limit)
+        for row in rows:
+            row["size_h"] = _size_fmt(row["size"])
+        _print_table(
+            rows,
+            [
+                ("id", "ID"),
+                ("version_id", "バージョン"),
+                ("source_db", "元DB"),
+                ("fmt", "形式"),
+                ("size_h", "サイズ"),
+                ("created_at", "作成日時 (UTC)"),
+                ("note", "メモ"),
+            ],
+        )
+    elif args.agent_cmd == "delete":
+        AgentClient(agents.get(args.name)).delete_backup(args.backup_id)
+        print(f"エージェントから削除しました: {args.backup_id}")
+        for rec in catalog.list_backups():
+            if rec.get("agent_profile") == args.name and rec.get("agent_backup_id") == args.backup_id:
+                catalog.delete_backup(rec["version_id"])
+                print(f"カタログからも削除しました: {rec['version_id']}")
+    elif args.agent_cmd == "dbs":
+        rows = AgentClient(agents.get(args.name)).databases(
+            args.remote_profile, include_templates=args.templates
+        )
+        _print_table(
+            rows,
+            [
+                ("name", "データベース"),
+                ("owner", "所有者"),
+                ("encoding", "エンコーディング"),
+                ("size", "サイズ"),
+            ],
+        )
+    elif args.agent_cmd == "pull":
+        agent = agents.get(args.name)
+        client = AgentClient(agent)
+        existing = {
+            row["name"] for row in client.databases(args.remote_profile, include_templates=True)
+        }
+        targets = sorted(existing - backup_mod.SYSTEM_DBS) if args.all else (args.db or [])
+        if not targets:
+            raise PgBackupError("対象 DB を --db または --all で指定してください")
+        missing = [db for db in targets if db not in existing]
+        if missing:
+            raise PgBackupError(f"エージェント側に存在しない DB: {', '.join(missing)}")
+        backup_mod.check_mode_options(
+            "file", fmt=args.fmt, out=args.out, n_dbs=len(targets)
+        )
+        for db in targets:
+            rec = backup_mod.backup_agent_database_to_file(
+                catalog,
+                agent,
+                args.remote_profile,
+                db,
+                fmt=args.fmt,
+                out=Path(args.out) if args.out else None,
+                note=args.note,
+                keep_owner=args.keep_owner,
+            )
+            print(f"取得完了: {rec['version_id']} -> {rec['location']} ({_size_fmt(rec['size'])})")
+    elif args.agent_cmd == "snapshot":
+        client = AgentClient(agents.get(args.name))
+        rec = client.create_snapshot(
+            args.remote_profile,
+            args.db,
+            version_id=args.version_id,
+            fmt=args.fmt,
+            keep_owner=args.keep_owner,
+            note=args.note,
+        )
+        print(f"エージェント内スナップショット完了: {rec['version_id']} ({_size_fmt(rec['size'])})")
+        print(f"  backup ID: {rec['id']}")
+    elif args.agent_cmd == "restore":
+        rec = AgentClient(agents.get(args.name)).restore_remote_backup(
+            args.backup_id,
+            args.remote_profile,
+            dest_db=args.db,
+            drop=args.drop,
+            keep_owner=args.keep_owner,
+        )
+        print(f"エージェント側リストア完了: {args.name}:{args.backup_id} -> {args.remote_profile}:{rec['dest_db']}")
     return 0
 
 
@@ -288,16 +460,17 @@ def build_parser() -> argparse.ArgumentParser:
     pi.set_defaults(func=cmd_inspect)
 
     # backup
-    pb = sub.add_parser("backup", help="バックアップの実行 (file / archive / clone)")
+    pb = sub.add_parser("backup", help="バックアップの実行 (file / archive / clone / agent)")
     pb.add_argument("profile", help="バックアップ元プロファイル")
     pb.add_argument("--db", action="append", help="対象 DB (複数指定可)")
     pb.add_argument("--all", action="store_true", help="テンプレート以外の全 DB を対象にする")
-    pb.add_argument("--mode", choices=["file", "archive", "clone"], default="file")
+    pb.add_argument("--mode", choices=["file", "archive", "clone", "agent"], default="file")
     pb.add_argument("--fmt", choices=["plain", "custom"], default=None,
-                    help="file モードの形式 (plain=SQL ファイル [既定], custom=pg_restore 用)")
+                    help="file / agent モードの形式 (agent の既定は custom)")
     pb.add_argument("--out", help="file モードの出力先 (ファイルまたはディレクトリ)")
     pb.add_argument("--dest", help="archive/clone モードの保存先プロファイル (archive の既定は元と同じ)")
     pb.add_argument("--dest-db", help="clone モードの複製先 DB 名 (既定: 元と同名)")
+    pb.add_argument("--agent", help="agent モードの保存先エージェント")
     pb.add_argument("--archive-db", default=DEFAULT_ARCHIVE_DB,
                     help=f"archive モードの格納 DB 名 (既定: {DEFAULT_ARCHIVE_DB})")
     pb.add_argument("--drop", action="store_true", help="clone: 複製先に同名 DB があれば削除して作り直す")
@@ -351,6 +524,77 @@ def build_parser() -> argparse.ArgumentParser:
     pad.add_argument("version_id")
     pad.add_argument("--archive-db", default=DEFAULT_ARCHIVE_DB)
     pad.set_defaults(func=cmd_archive)
+
+    # agent
+    pag = sub.add_parser("agent", help="HTTPS バックアップエージェントの管理・操作")
+    pags = pag.add_subparsers(dest="agent_cmd", required=True)
+    pagi = pags.add_parser("init", help="サーバー証明書・トークン・pairing bundle を生成")
+    pagi.add_argument("--name", required=True, help="エージェント名")
+    pagi.add_argument("--public-url", required=True, help="接続に使う URL (https://host:port)")
+    pagi.add_argument("--pairing-out", help="pairing bundle の出力先")
+    pagi.add_argument("--storage-dir", help="ダンプ保管ディレクトリ")
+    pagi.add_argument("--max-upload-gib", type=float, default=100.0)
+    pagi.add_argument("--max-storage-gib", type=float, default=500.0)
+    pagi.add_argument("--allow-db-read", action="store_true", help="この端末の DB 一覧・dump を許可")
+    pagi.add_argument("--allow-db-restore", action="store_true", help="この端末への DB 復元を許可")
+    pagi.add_argument("--overwrite", action="store_true", help="既存証明書・トークンを再生成")
+    pagi.set_defaults(func=cmd_agent)
+    pagsv = pags.add_parser("serve", help="一時 HTTPS サーバーを起動")
+    pagsv.add_argument("--config", help="server.json のパス")
+    pagsv.add_argument("--host", default="127.0.0.1", help="listen アドレス (リモート用: 0.0.0.0)")
+    pagsv.add_argument("--port", type=int, help="listen ポート (既定: public URL のポート)")
+    pagsv.set_defaults(func=cmd_agent)
+    paga = pags.add_parser("add", help="pairing bundle から接続先を登録")
+    paga.add_argument("pairing_file")
+    paga.add_argument("--name", help="ローカルで使う別名")
+    paga.add_argument("--overwrite", action="store_true")
+    paga.set_defaults(func=cmd_agent)
+    pagl = pags.add_parser("list", help="登録済みエージェント一覧")
+    pagl.set_defaults(func=cmd_agent)
+    for command, help_text in (("remove", "登録を削除"), ("test", "TLS・認証・互換性をテスト")):
+        parser = pags.add_parser(command, help=help_text)
+        parser.add_argument("name")
+        parser.set_defaults(func=cmd_agent)
+    pagb = pags.add_parser("backups", help="リモート保管庫のバックアップ一覧")
+    pagb.add_argument("name")
+    pagb.add_argument("--limit", type=int, default=200)
+    pagb.set_defaults(func=cmd_agent)
+    pagd = pags.add_parser("delete", help="リモート保管庫から削除")
+    pagd.add_argument("name")
+    pagd.add_argument("backup_id")
+    pagd.set_defaults(func=cmd_agent)
+    pagdb = pags.add_parser("dbs", help="エージェント端末のローカル DB 一覧")
+    pagdb.add_argument("name")
+    pagdb.add_argument("--remote-profile", required=True)
+    pagdb.add_argument("--templates", action="store_true")
+    pagdb.set_defaults(func=cmd_agent)
+    pagp = pags.add_parser("pull", help="エージェント端末の DB を手元へ取得")
+    pagp.add_argument("name")
+    pagp.add_argument("--remote-profile", required=True)
+    pagp.add_argument("--db", action="append")
+    pagp.add_argument("--all", action="store_true")
+    pagp.add_argument("--fmt", choices=["plain", "custom"], default="custom")
+    pagp.add_argument("--out")
+    pagp.add_argument("--note")
+    pagp.add_argument("--keep-owner", action="store_true")
+    pagp.set_defaults(func=cmd_agent)
+    pagsn = pags.add_parser("snapshot", help="エージェント内で DB を直接保管")
+    pagsn.add_argument("name")
+    pagsn.add_argument("--remote-profile", required=True)
+    pagsn.add_argument("--db", required=True)
+    pagsn.add_argument("--version-id")
+    pagsn.add_argument("--fmt", choices=["plain", "custom"], default="custom")
+    pagsn.add_argument("--note")
+    pagsn.add_argument("--keep-owner", action="store_true")
+    pagsn.set_defaults(func=cmd_agent)
+    pagr = pags.add_parser("restore", help="保管済みバックアップをエージェント端末で復元")
+    pagr.add_argument("name")
+    pagr.add_argument("backup_id")
+    pagr.add_argument("--remote-profile", required=True)
+    pagr.add_argument("--db")
+    pagr.add_argument("--drop", action="store_true")
+    pagr.add_argument("--keep-owner", action="store_true")
+    pagr.set_defaults(func=cmd_agent)
 
     # history
     ph = sub.add_parser("history", help="操作履歴の表示")

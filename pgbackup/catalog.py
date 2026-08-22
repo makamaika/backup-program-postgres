@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS backups (
     archive_profile TEXT,           -- archive: 格納先プロファイル名
     archive_db TEXT,                -- archive: 格納先 DB 名
     archive_row_id INTEGER,         -- archive: pgbackup_archive.id
+    agent_profile TEXT,             -- agent: 格納先エージェント名
+    agent_backup_id TEXT,           -- agent: リモート保管庫の ID
     size INTEGER,
     sha256 TEXT,
     pg_dump_version TEXT,
@@ -62,6 +64,10 @@ class Catalog:
             cols = {r[1] for r in conn.execute("PRAGMA table_info(backups)").fetchall()}
             if "status" not in cols:
                 conn.execute("ALTER TABLE backups ADD COLUMN status TEXT NOT NULL DEFAULT 'done'")
+            if "agent_profile" not in cols:
+                conn.execute("ALTER TABLE backups ADD COLUMN agent_profile TEXT")
+            if "agent_backup_id" not in cols:
+                conn.execute("ALTER TABLE backups ADD COLUMN agent_backup_id TEXT")
 
     @contextmanager
     def _conn(self):
@@ -98,6 +104,7 @@ class Catalog:
         """pending 行にバックアップ結果を書き込み status='done' にする。"""
         allowed = {
             "location", "archive_profile", "archive_db", "archive_row_id",
+            "agent_profile", "agent_backup_id",
             "size", "sha256", "pg_dump_version", "note",
         }
         bad = set(fields) - allowed

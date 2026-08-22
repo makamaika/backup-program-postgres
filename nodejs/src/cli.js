@@ -16,12 +16,14 @@ import readline from "node:readline";
 import { Command, InvalidArgumentError } from "commander";
 
 import * as archiveMod from "./archive.js";
+import { AgentClient } from "./agent.js";
 import * as backupMod from "./backup.js";
 import * as inspectMod from "./inspect.js";
 import * as restoreMod from "./restore.js";
 import { Catalog } from "./catalog.js";
 import {
-  DEFAULT_ARCHIVE_DB, ProfileStore, cleanupTmp, makeProfile, profileDisplay, profileMasked,
+  AgentProfileStore, DEFAULT_ARCHIVE_DB, ProfileStore, agentMasked, cleanupTmp,
+  makeProfile, profileDisplay, profileMasked,
 } from "./config.js";
 import { serverVersion } from "./db.js";
 import { PgBackupError } from "./errors.js";
@@ -119,6 +121,7 @@ function collect(value, previous) {
 
 export async function main(argv) {
   const store = new ProfileStore();
+  const agents = new AgentProfileStore();
   const catalog = new Catalog();
   cleanupTmp();
 
@@ -224,14 +227,15 @@ export async function main(argv) {
   // ---- backup ----
   program
     .command("backup <profile>")
-    .description("バックアップの実行 (file / archive / clone)")
+    .description("バックアップの実行 (file / archive / clone / agent)")
     .option("--db <name>", "対象 DB (複数指定可)", collect, [])
     .option("--all", "テンプレート以外の全 DB を対象にする")
-    .option("--mode <mode>", "file | archive | clone", "file")
-    .option("--fmt <fmt>", "file モードの形式 (plain=SQL ファイル [既定], custom=pg_restore 用)")
+    .option("--mode <mode>", "file | archive | clone | agent", "file")
+    .option("--fmt <fmt>", "file / agent モードの形式")
     .option("--out <path>", "file モードの出力先 (ファイルまたはディレクトリ)")
     .option("--dest <profile>", "archive/clone モードの保存先プロファイル (archive の既定は元と同じ)")
     .option("--dest-db <name>", "clone モードの複製先 DB 名 (既定: 元と同名)")
+    .option("--agent <name>", "agent モードの保存先エージェント")
     .option("--archive-db <name>", `archive モードの格納 DB 名 (既定: ${DEFAULT_ARCHIVE_DB})`, DEFAULT_ARCHIVE_DB)
     .option("--drop", "clone: 複製先に同名 DB があれば削除して作り直す")
     .option("--keep-owner", "clone / file(plain): 所有者・権限情報も含める (既定は移植性優先で除外)")
@@ -241,7 +245,7 @@ export async function main(argv) {
       const dbs = await backupMod.resolveTargetDbs(source, opts.db, Boolean(opts.all), opts.archiveDb);
       const fmt = backupMod.checkModeOptions(opts.mode, {
         fmt: opts.fmt ?? null, out: opts.out ?? null, dest: opts.dest ?? null,
-        destDb: opts.destDb ?? null, drop: Boolean(opts.drop),
+        destDb: opts.destDb ?? null, agent: opts.agent ?? null, drop: Boolean(opts.drop),
         keepOwner: Boolean(opts.keepOwner), nDbs: dbs.length,
       });
 
@@ -261,6 +265,14 @@ export async function main(argv) {
             archiveDb: opts.archiveDb, note: opts.note ?? null,
           });
           console.log(`アーカイブ保存: ${rec.version_id} -> ${dest.name}:${opts.archiveDb} (${sizeFmt(rec.size)})`);
+        }
+      } else if (opts.mode === "agent") {
+        const agent = agents.get(opts.agent);
+        for (const db of dbs) {
+          const rec = await backupMod.backupToAgent(catalog, source, db, agent, {
+            fmt, note: opts.note ?? null, keepOwner: Boolean(opts.keepOwner),
+          });
+          console.log(`エージェント保存: ${rec.version_id} -> ${agent.name}:${rec.agent_backup_id} (${sizeFmt(rec.size)})`);
         }
       } else {
         for (const db of dbs) {
@@ -283,7 +295,8 @@ export async function main(argv) {
       const rows = catalog.listBackups(opts.profile ?? null, opts.db ?? null).map((r) => ({
         ...r,
         size_h: sizeFmt(r.size),
-        place: r.mode === "file" ? r.location : `${r.archive_profile}:${r.archive_db}`,
+        place: r.mode === "file" ? r.location : r.mode === "archive"
+          ? `${r.archive_profile}:${r.archive_db}` : `${r.agent_profile}:${r.agent_backup_id}`,
       }));
       printTable(rows, [
         ["version_id", "バージョン"], ["mode", "モード"], ["fmt", "形式"],
@@ -302,7 +315,7 @@ export async function main(argv) {
     .action(async (versionId, opts) => {
       const dest = store.get(opts.dest);
       const r = await restoreMod.restoreVersion(catalog, store, versionId, dest, {
-        destDb: opts.db ?? null, drop: Boolean(opts.drop), keepOwner: Boolean(opts.keepOwner),
+        destDb: opts.db ?? null, drop: Boolean(opts.drop), keepOwner: Boolean(opts.keepOwner), agents,
       });
       console.log(`リストア完了: ${versionId} -> ${dest.name}:${r.dest_db}`);
     });
@@ -339,6 +352,95 @@ export async function main(argv) {
         ["version_id", "バージョン"], ["source_db", "元DB"], ["size_h", "サイズ"],
         ["created_at", "作成日時"], ["note", "メモ"],
       ]);
+    });
+
+  // ---- HTTPS backup agent ----
+  const agentCmd = program.command("agent").description("HTTPS バックアップエージェントの管理・操作");
+  agentCmd.command("add <pairingFile>")
+    .description("Python版 agent init が生成した pairing bundle を登録")
+    .option("--name <name>", "ローカルで使う別名")
+    .option("--overwrite")
+    .action((pairingFile, opts) => {
+      const profile = agents.addPairingFile(pairingFile, opts.name ?? null, Boolean(opts.overwrite));
+      console.log(`エージェント '${profile.name}' を登録しました (${profile.url})`);
+    });
+  agentCmd.command("list").description("登録一覧").action(() => {
+    printTable(agents.list().map(agentMasked), [["name", "名前"], ["url", "URL"], ["token", "トークン"]]);
+  });
+  agentCmd.command("remove <name>").description("登録を削除").action((name) => {
+    agents.remove(name);
+    console.log(`エージェント '${name}' を削除しました`);
+  });
+  agentCmd.command("test <name>").description("TLS・認証・互換性をテスト").action(async (name) => {
+    const h = await new AgentClient(agents.get(name)).health();
+    console.log(`OK: ${h.name} / capabilities=${h.capabilities.join(",")}`);
+  });
+  agentCmd.command("backups <name>").description("リモート保管庫の一覧")
+    .option("--limit <n>", "表示件数", intArg("limit", 1, 1000), 200)
+    .action(async (name, opts) => {
+      const rows = (await new AgentClient(agents.get(name)).listBackups(opts.limit))
+        .map((r) => ({ ...r, size_h: sizeFmt(r.size) }));
+      printTable(rows, [["id", "ID"], ["version_id", "バージョン"], ["source_db", "元DB"],
+        ["fmt", "形式"], ["size_h", "サイズ"], ["created_at", "作成日時"], ["note", "メモ"]]);
+    });
+  agentCmd.command("delete <name> <backupId>").description("リモート保管庫から削除")
+    .action(async (name, backupId) => {
+      await new AgentClient(agents.get(name)).deleteBackup(backupId);
+      console.log(`エージェントから削除しました: ${backupId}`);
+      for (const rec of catalog.listBackups()) {
+        if (rec.agent_profile === name && rec.agent_backup_id === backupId) {
+          catalog.deleteBackup(rec.version_id);
+          console.log(`カタログからも削除しました: ${rec.version_id}`);
+        }
+      }
+    });
+  agentCmd.command("dbs <name>").description("エージェント端末のローカル DB 一覧")
+    .requiredOption("--remote-profile <name>")
+    .option("--templates")
+    .action(async (name, opts) => {
+      const rows = await new AgentClient(agents.get(name)).databases(opts.remoteProfile, Boolean(opts.templates));
+      printTable(rows, [["name", "データベース"], ["owner", "所有者"],
+        ["encoding", "エンコーディング"], ["size", "サイズ"]]);
+    });
+  agentCmd.command("pull <name>").description("エージェント端末の DB を手元へ取得")
+    .requiredOption("--remote-profile <name>")
+    .requiredOption("--db <name>")
+    .option("--fmt <fmt>", "plain | custom", "custom")
+    .option("--out <path>")
+    .option("--note <text>")
+    .option("--keep-owner")
+    .action(async (name, opts) => {
+      const rec = await backupMod.backupAgentDatabaseToFile(
+        catalog, agents.get(name), opts.remoteProfile, opts.db,
+        { fmt: opts.fmt, out: opts.out ?? null, note: opts.note ?? null, keepOwner: Boolean(opts.keepOwner) }
+      );
+      console.log(`取得完了: ${rec.version_id} -> ${rec.location} (${sizeFmt(rec.size)})`);
+    });
+  agentCmd.command("snapshot <name>").description("エージェント内で DB を直接保管")
+    .requiredOption("--remote-profile <name>")
+    .requiredOption("--db <name>")
+    .option("--version-id <id>")
+    .option("--fmt <fmt>", "plain | custom", "custom")
+    .option("--note <text>")
+    .option("--keep-owner")
+    .action(async (name, opts) => {
+      const rec = await new AgentClient(agents.get(name)).createSnapshot(opts.remoteProfile, opts.db, {
+        versionId: opts.versionId ?? null, fmt: opts.fmt,
+        note: opts.note ?? null, keepOwner: Boolean(opts.keepOwner),
+      });
+      console.log(`エージェント内スナップショット完了: ${rec.version_id} (${sizeFmt(rec.size)})`);
+      console.log(`  backup ID: ${rec.id}`);
+    });
+  agentCmd.command("restore <name> <backupId>").description("保管済みバックアップをエージェント端末で復元")
+    .requiredOption("--remote-profile <name>")
+    .option("--db <name>")
+    .option("--drop")
+    .option("--keep-owner")
+    .action(async (name, backupId, opts) => {
+      const rec = await new AgentClient(agents.get(name)).restoreRemoteBackup(backupId, opts.remoteProfile, {
+        destDb: opts.db ?? null, drop: Boolean(opts.drop), keepOwner: Boolean(opts.keepOwner),
+      });
+      console.log(`エージェント側リストア完了: ${name}:${backupId} -> ${opts.remoteProfile}:${rec.dest_db}`);
     });
   arch
     .command("restore <profile> <versionId>")

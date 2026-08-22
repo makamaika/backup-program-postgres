@@ -89,6 +89,7 @@
 </header>
 <nav id="nav">
   <button data-view="conn">接続</button>
+  <button data-view="agents">バックアップエージェント</button>
   <button data-view="browse" class="active">データベース</button>
   <button data-view="backup">バックアップ</button>
   <button data-view="versions">バージョン・リストア</button>
@@ -227,16 +228,23 @@ function renderJobs() {
 
 // ---------------------------------------------------------------- ビュー管理
 
-const state = { view: "browse", profiles: [], browse: {}, backup: {}, versions: {} };
+const state = { view: "browse", profiles: [], agents: [], browse: {}, backup: {}, versions: {}, agent: {} };
 
 async function loadProfiles() {
   state.profiles = await api("/api/profiles");
+  state.agents = await api("/api/agents");
 }
 
 function profileOptions(selected) {
   return state.profiles.map(p =>
     `<option value="${esc(p.name)}" ${p.name === selected ? "selected" : ""}>` +
     `${esc(p.name)} (${esc(p.user)}@${esc(p.host)}:${p.port})</option>`).join("");
+}
+
+function agentOptions(selected) {
+  return state.agents.map(a =>
+    `<option value="${esc(a.name)}" ${a.name === selected ? "selected" : ""}>` +
+    `${esc(a.name)} (${esc(a.url)})</option>`).join("");
 }
 
 async function show(view) {
@@ -250,6 +258,7 @@ async function show(view) {
   }
   const main = $("#main");
   if (view === "conn") renderConn(main);
+  else if (view === "agents") renderAgents(main);
   else if (view === "browse") renderBrowse(main);
   else if (view === "backup") renderBackup(main);
   else if (view === "versions") renderVersions(main);
@@ -317,6 +326,139 @@ function renderConn(main) {
       }});
       toast("プロファイルを追加しました"); show("conn");
     } catch (e2) { toast(e2.message, "err"); }
+  });
+}
+
+// ---------------------------------------------------------------- バックアップエージェントビュー
+
+function renderAgents(main) {
+  const st = state.agent;
+  main.innerHTML = `
+    <h2>HTTPS バックアップエージェント</h2>
+    <div class="panel">
+      <p style="margin-top:0">PostgreSQL の 5432 番ポートを公開せず、別端末で一時起動した専用 HTTPS
+        サーバーへダンプを保存・取得します。通信は自己署名証明書の固定と 256bit 以上のトークンで保護されます。</p>
+      <div class="scroll"><table id="a-table"></table></div>
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0">pairing bundle を登録</h3>
+      <div class="form-grid">
+        <span>pairing JSON</span><textarea id="a-pairing" rows="8"
+          placeholder='pgbackup agent init が生成した pairing-*.json の内容'></textarea>
+        <span>ファイルから読込</span><input id="a-file" type="file" accept="application/json,.json">
+        <span></span><label><input type="checkbox" id="a-overwrite"> 同名なら上書き</label>
+      </div>
+      <div class="row"><button id="a-add">登録</button>
+        <span class="muted">pairing JSON には秘密トークンが含まれます。登録後、元ファイルは安全に削除してください。</span></div>
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0">エージェント端末の PostgreSQL</h3>
+      <div class="row">
+        <span>エージェント</span><select id="a-agent">${agentOptions(st.name)}</select>
+        <span>リモート側プロファイル</span><input id="a-remote-profile" value="${esc(st.remoteProfile || "local")}">
+        <button id="a-load-dbs" class="secondary">DB 一覧</button>
+        <button id="a-load-backups" class="secondary">保管庫一覧</button>
+      </div>
+      <div id="a-remote-out" class="muted">DB 読み取りはエージェント側で明示許可されている場合のみ利用できます。</div>
+    </div>`;
+
+  const table = $("#a-table");
+  table.innerHTML = `<tr><th>名前</th><th>URL</th><th>トークン</th><th></th></tr>` +
+    (state.agents.map(a => `<tr><td><b>${esc(a.name)}</b></td><td class="mono">${esc(a.url)}</td>
+      <td>${esc(a.token)}</td><td>
+        <button class="small secondary" data-atest="${esc(a.name)}">接続テスト</button>
+        <button class="small danger" data-adel="${esc(a.name)}">削除</button></td></tr>`).join("") ||
+      `<tr><td colspan="4" class="muted">エージェントが未登録です。</td></tr>`);
+
+  $$('[data-atest]', table).forEach(btn => btn.onclick = e => withDisabled(e.target, async () => {
+    try {
+      const h = await api(`/api/agents/${enc(btn.dataset.atest)}/test`, { method: "POST" });
+      toast(`接続 OK — ${h.name} / ${h.capabilities.join(", ")}`);
+    } catch (err) { toast(err.message, "err"); }
+  }));
+  $$('[data-adel]', table).forEach(btn => btn.onclick = async () => {
+    if (!confirm(`エージェント '${btn.dataset.adel}' のローカル登録を削除しますか?`)) return;
+    try { await api(`/api/agents/${enc(btn.dataset.adel)}`, { method: "DELETE" });
+      toast("削除しました"); show("agents"); } catch (err) { toast(err.message, "err"); }
+  });
+
+  $("#a-file").onchange = async e => {
+    const file = e.target.files[0];
+    if (file) $("#a-pairing").value = await file.text();
+  };
+  $("#a-add").onclick = e => withDisabled(e.target, async () => {
+    try {
+      const pairing = JSON.parse($("#a-pairing").value);
+      if (pairing.protocol !== 1) throw new Error("未対応の pairing protocol です");
+      await api("/api/agents", { body: {
+        name: pairing.name, url: pairing.url, token: pairing.token,
+        ca_cert: pairing.ca_cert, overwrite: $("#a-overwrite").checked,
+      }});
+      toast("エージェントを登録しました"); show("agents");
+    } catch (err) { toast("登録できません: " + err.message, "err"); }
+  });
+
+  if (!state.agents.length) {
+    $("#a-agent").disabled = true;
+    $("#a-load-dbs").disabled = true;
+    $("#a-load-backups").disabled = true;
+    return;
+  }
+
+  function selected() {
+    st.name = $("#a-agent").value;
+    st.remoteProfile = $("#a-remote-profile").value.trim();
+    if (!st.remoteProfile) throw new Error("リモート側プロファイル名を入力してください");
+    return { agent: st.name, remoteProfile: st.remoteProfile };
+  }
+
+  $("#a-load-dbs").onclick = e => withDisabled(e.target, async () => {
+    const out = $("#a-remote-out"); out.textContent = "読み込み中…";
+    try {
+      const { agent, remoteProfile } = selected();
+      const rows = await api(`/api/agent-databases?agent=${enc(agent)}&remote_profile=${enc(remoteProfile)}`);
+      out.innerHTML = `<div class="scroll"><table><tr><th>DB</th><th>所有者</th><th>サイズ</th><th></th></tr>
+        ${rows.map(db => `<tr><td><b>${esc(db.name)}</b></td><td>${esc(db.owner)}</td><td>${esc(db.size || "")}</td>
+          <td><button class="small" data-apull="${esc(db.name)}">手元へ取得</button>
+          <button class="small secondary" data-asnapshot="${esc(db.name)}">エージェント内に保存</button></td></tr>`).join("")}
+        </table></div>`;
+      $$('[data-apull]', out).forEach(btn => btn.onclick = ev => withDisabled(ev.target, async () => {
+        try { const r = await api("/api/agent-pull", { body: {
+          agent, remote_profile: remoteProfile, db: btn.dataset.apull, fmt: "custom" } });
+          watchJob(r.job_id); } catch (err) { toast(err.message, "err"); }
+      }));
+      $$('[data-asnapshot]', out).forEach(btn => btn.onclick = ev => withDisabled(ev.target, async () => {
+        try { const r = await api("/api/agent-snapshot", { body: {
+          agent, remote_profile: remoteProfile, db: btn.dataset.asnapshot, fmt: "custom" } });
+          watchJob(r.job_id); } catch (err) { toast(err.message, "err"); }
+      }));
+    } catch (err) { out.textContent = ""; toast(err.message, "err"); }
+  });
+
+  $("#a-load-backups").onclick = e => withDisabled(e.target, async () => {
+    const out = $("#a-remote-out"); out.textContent = "読み込み中…";
+    try {
+      const { agent, remoteProfile } = selected();
+      const rows = await api(`/api/agent-backups?agent=${enc(agent)}`);
+      out.innerHTML = `<div class="scroll"><table><tr><th>ID</th><th>バージョン</th><th>元DB</th><th>サイズ</th><th></th></tr>
+        ${rows.map(b => `<tr><td class="mono">${esc(b.id)}</td><td class="mono">${esc(b.version_id)}</td>
+          <td>${esc(b.source_db)}</td><td>${sizeFmt(b.size)}</td><td>
+          <button class="small" data-arrestore="${esc(b.id)}" data-db="${esc(b.source_db)}">この端末で復元</button>
+          <button class="small danger" data-abdelete="${esc(b.id)}">削除</button></td></tr>`).join("") ||
+          `<tr><td colspan="5" class="muted">保管庫は空です。</td></tr>`}</table></div>`;
+      $$('[data-arrestore]', out).forEach(btn => btn.onclick = ev => withDisabled(ev.target, async () => {
+        const db = prompt("復元先 DB 名", btn.dataset.db); if (!db) return;
+        const drop = confirm("同名 DB がある場合、安全に退避して置き換えますか?");
+        try { const r = await api("/api/agent-remote-restore", { body: {
+          agent, backup_id: btn.dataset.arrestore, remote_profile: remoteProfile, db, drop } });
+          watchJob(r.job_id); } catch (err) { toast(err.message, "err"); }
+      }));
+      $$('[data-abdelete]', out).forEach(btn => btn.onclick = async () => {
+        if (!confirm("このバックアップをエージェントから削除しますか?")) return;
+        try { await api(`/api/agent-backups/${enc(btn.dataset.abdelete)}?agent=${enc(agent)}`, { method: "DELETE" });
+          toast("削除しました"); $("#a-load-backups").click(); } catch (err) { toast(err.message, "err"); }
+      });
+    } catch (err) { out.textContent = ""; toast(err.message, "err"); }
   });
 }
 
@@ -471,6 +613,9 @@ function renderBackup(main) {
       <div class="row">
         <label><input type="radio" name="k-mode" value="clone">
           <b>複製 (クローン)</b> — DB をそのまま別の DB として複製 (ローカル⇔リモート任意)</label></div>
+      <div class="row">
+        <label><input type="radio" name="k-mode" value="agent">
+          <b>HTTPS エージェント</b> — PostgreSQL ポートを公開せず別端末へ暗号化転送</label></div>
 
       <div id="k-opt-file" class="form-grid" style="margin-top:10px">
         <span>形式</span><select id="k-fmt">
@@ -488,6 +633,11 @@ function renderBackup(main) {
         <span></span><label><input type="checkbox" id="k-drop"> 複製先に同名 DB があれば削除して作り直す</label>
         <span></span><label><input type="checkbox" id="k-keep-owner"> 所有者・権限も複製する</label>
       </div>
+      <div id="k-opt-agent" class="form-grid" style="display:none; margin-top:10px">
+        <span>保存先</span><select id="k-agent-dest">${agentOptions()}</select>
+        <span></span><label><input type="checkbox" id="k-agent-owner"> 所有者・権限も含める</label>
+        <span></span><span class="muted">非ループバック接続は HTTPS と証明書固定が必須です。</span>
+      </div>
       <div class="form-grid" style="margin-top:6px">
         <span>メモ</span><input id="k-note" placeholder="(任意) このバックアップの説明">
       </div>
@@ -503,9 +653,11 @@ function renderBackup(main) {
 
   $$("input[name=k-mode]").forEach(r => r.onchange = () => {
     const m = $("input[name=k-mode]:checked").value;
-    $("#k-opt-file").style.display = m === "file" ? "grid" : "none";
+    $("#k-opt-file").style.display = (m === "file" || m === "agent") ? "grid" : "none";
     $("#k-opt-archive").style.display = m === "archive" ? "grid" : "none";
     $("#k-opt-clone").style.display = m === "clone" ? "grid" : "none";
+    $("#k-opt-agent").style.display = m === "agent" ? "grid" : "none";
+    if (m === "agent") $("#k-fmt").value = "custom";
   });
 
   async function loadDbs() {
@@ -545,13 +697,18 @@ function renderBackup(main) {
       note: $("#k-note").value || null,
       archive_db: $("#k-arch-db").value.trim() || "BACK_UP_DB",
     };
-    if (mode === "file") body.fmt = $("#k-fmt").value;
+    if (mode === "file" || mode === "agent") body.fmt = $("#k-fmt").value;
     if (mode === "archive") body.dest = $("#k-arch-dest").value || null;
     if (mode === "clone") {
       body.dest = $("#k-clone-dest").value;
       body.dest_db = $("#k-clone-db").value.trim() || null;
       body.drop = $("#k-drop").checked;
       body.keep_owner = $("#k-keep-owner").checked;
+    }
+    if (mode === "agent") {
+      if (!state.agents.length) { toast("先にエージェントを登録してください", "err"); return; }
+      body.agent = $("#k-agent-dest").value;
+      body.keep_owner = $("#k-agent-owner").checked;
     }
     try {
       const r = await api("/api/backup", { body });
@@ -606,7 +763,9 @@ function renderVersions(main) {
           <td>${esc(r.fmt)}</td><td class="num">${sizeFmt(r.size)}</td>
           <td class="mono">${esc(r.created_at)}</td>
           <td class="mono" style="max-width:280px;overflow-wrap:anywhere">
-            ${esc(r.mode === "file" ? r.location : r.archive_profile + ":" + r.archive_db)}</td>
+            ${esc(r.mode === "file" ? r.location : r.mode === "archive"
+              ? r.archive_profile + ":" + r.archive_db
+              : r.agent_profile + ":" + r.agent_backup_id)}</td>
           <td>${esc(r.note || "")}</td>
           <td><button class="small" data-restore="${esc(r.version_id)}" data-db="${esc(r.db)}">リストア</button></td>
         </tr>`).join("") || `<tr><td class="muted" colspan="8">バックアップがまだありません。</td></tr>`}

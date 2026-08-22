@@ -11,3 +11,4 @@ export class ProfileError extends PgBackupError {}
 export class ToolError extends PgBackupError {}
 export class BackupError extends PgBackupError {}
 export class RestoreError extends PgBackupError {}
+export class AgentError extends PgBackupError {}

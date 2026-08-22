@@ -105,6 +105,12 @@ def main() -> int:
             for p in api("/api/profiles"):
                 assert p.get("password") in (None, "********")
 
+        @check("GET /api/agents は秘密情報を返さない")
+        def _():
+            for agent in api("/api/agents"):
+                assert agent.get("token") == "********"
+                assert "ca_cert" not in agent
+
         @check("POST /api/profiles/{name}/test")
         def _():
             r = api("/api/profiles/local/test", body={})
@@ -191,6 +197,26 @@ def main() -> int:
                 raise AssertionError("400 を期待したが成功した")
             except urllib.error.HTTPError as e:
                 assert e.code == 400
+
+        @check("セキュリティ: 不正 Host / 異なる Origin を拒否")
+        def _():
+            bad_host = urllib.request.Request(BASE + "/api/profiles", headers={"Host": "evil.example"})
+            try:
+                urllib.request.urlopen(bad_host, timeout=10)
+                raise AssertionError("不正 Host が許可された")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 400
+            bad_origin = urllib.request.Request(
+                BASE + "/api/profiles/local/test",
+                data=b"{}",
+                headers={"Content-Type": "application/json", "Origin": "https://evil.example"},
+                method="POST",
+            )
+            try:
+                urllib.request.urlopen(bad_origin, timeout=10)
+                raise AssertionError("異なる Origin が許可された")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 403
 
     finally:
         server.terminate()

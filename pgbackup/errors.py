@@ -19,3 +19,7 @@ class BackupError(PgBackupError):
 
 class RestoreError(PgBackupError):
     """リストア処理の失敗。"""
+
+
+class AgentError(PgBackupError):
+    """バックアップエージェントの設定・通信・保存処理の失敗。"""

@@ -18,6 +18,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Assert-NativeSuccess([string]$Label) {
+    if ($LASTEXITCODE -ne 0) { throw "$Label が失敗しました (exit=$LASTEXITCODE)" }
+}
+
 if (-not $PgBin) {
     $candidates = Get-ChildItem "C:\Program Files\PostgreSQL\*\bin\pg_ctl.exe" -ErrorAction SilentlyContinue
     if (-not $candidates) { throw "PostgreSQL が見つかりません。-PgBin を指定してください。" }
@@ -32,16 +36,23 @@ foreach ($c in @(@{dir = "pgA"; port = $PortA }, @{dir = "pgB"; port = $PortB })
     $data = Join-Path $Root $c.dir
     if (-not (Test-Path "$data\PG_VERSION")) {
         & "$PgBin\initdb.exe" -D $data -U postgres -A trust -E UTF8 --no-locale | Out-Null
+        Assert-NativeSuccess "initdb ($data)"
     }
     & "$PgBin\pg_ctl.exe" -D $data -l "$data.log" -o "-p $($c.port)" -w start
+    Assert-NativeSuccess "pg_ctl start ($data)"
 }
 
 $env:PGCLIENTENCODING = "UTF8"
 & "$PgBin\psql.exe" -h localhost -p $PortA -U postgres -c "CREATE DATABASE shop_db" -c "CREATE DATABASE inventory_db"
+Assert-NativeSuccess "クラスタ A の DB 作成"
 & "$PgBin\psql.exe" -h localhost -p $PortA -U postgres -d shop_db -v ON_ERROR_STOP=1 -q -f $seed
+Assert-NativeSuccess "shop_db のシード"
 & "$PgBin\psql.exe" -h localhost -p $PortA -U postgres -d inventory_db -c "CREATE TABLE items(id serial primary key, sku text, qty int); INSERT INTO items(sku, qty) SELECT 'SKU-'||i, i*3 FROM generate_series(1,100) i;"
+Assert-NativeSuccess "inventory_db のシード"
 & "$PgBin\psql.exe" -h localhost -p $PortB -U postgres -c "CREATE DATABASE analytics_db"
+Assert-NativeSuccess "クラスタ B の DB 作成"
 & "$PgBin\psql.exe" -h localhost -p $PortB -U postgres -d analytics_db -c "CREATE TABLE events(id bigserial primary key, kind text, payload jsonb, at timestamptz default now()); INSERT INTO events(kind, payload) SELECT 'click', jsonb_build_object('n', i) FROM generate_series(1,300) i;"
+Assert-NativeSuccess "analytics_db のシード"
 
 Write-Host ""
 Write-Host "準備完了: クラスタ A = localhost:$PortA (shop_db, inventory_db), クラスタ B = localhost:$PortB (analytics_db)"

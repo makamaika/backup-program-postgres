@@ -8,6 +8,7 @@
 // もう一方の版から一覧・復元できる。
 
 import fs from "node:fs";
+import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
@@ -39,6 +40,10 @@ export function tmpDir() {
 
 export function catalogPath() {
   return path.join(homeDir(), "catalog.db");
+}
+
+export function agentsPath() {
+  return path.join(homeDir(), "agents.json");
 }
 
 // 異常終了で残った一時ファイルを掃除する (CLI / Web の起動時に呼ぶ)
@@ -155,6 +160,105 @@ export class ProfileStore {
       throw new ProfileError(`接続プロファイル '${name}' が見つかりません`);
     }
     delete raw.profiles[name];
+    this._saveRaw(raw);
+  }
+}
+
+const AGENT_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/;
+
+export function makeAgentProfile(name, attrs = {}) {
+  const profile = {
+    name,
+    url: String(attrs.url ?? "").replace(/\/$/, ""),
+    token: String(attrs.token ?? ""),
+    ca_cert: String(attrs.ca_cert ?? ""),
+  };
+  if (!AGENT_NAME_RE.test(profile.name)) {
+    throw new ProfileError(`エージェント名 '${profile.name}' は使用できません`);
+  }
+  let parsed;
+  try { parsed = new URL(profile.url); } catch { throw new ProfileError("エージェント URL が不正です"); }
+  if (parsed.protocol !== "https:" || parsed.username || parsed.password
+      || parsed.search || parsed.hash || !["", "/"].includes(parsed.pathname)) {
+    throw new ProfileError("エージェント URL は https://ホスト:ポート の形式で指定してください");
+  }
+  if (parsed.port && (!Number.isInteger(Number(parsed.port)) || Number(parsed.port) < 1
+      || Number(parsed.port) > 65535)) throw new ProfileError("エージェント URL のポートが不正です");
+  if (profile.token.length < 32) throw new ProfileError("エージェントトークンが短すぎます");
+  try { new crypto.X509Certificate(profile.ca_cert); }
+  catch { throw new ProfileError("有効な CA 証明書がありません"); }
+  return profile;
+}
+
+export function agentMasked(profile) {
+  return { name: profile.name, url: profile.url, token: "********" };
+}
+
+export class AgentProfileStore {
+  constructor(filePath = null) {
+    this.path = filePath || agentsPath();
+  }
+
+  _loadRaw() {
+    if (!fs.existsSync(this.path)) return { agents: Object.create(null) };
+    const raw = JSON.parse(fs.readFileSync(this.path, "utf-8"));
+    raw.agents = Object.assign(Object.create(null), raw.agents ?? {});
+    return raw;
+  }
+
+  _saveRaw(data) {
+    fs.mkdirSync(path.dirname(this.path), { recursive: true });
+    const tmp = this.path + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { encoding: "utf-8", mode: 0o600 });
+    for (let attempt = 0; ; attempt++) {
+      try {
+        fs.renameSync(tmp, this.path);
+        return;
+      } catch (err) {
+        if (attempt >= 4 || !["EPERM", "EACCES", "EBUSY"].includes(err.code)) throw err;
+        const until = Date.now() + 50 * (attempt + 1);
+        while (Date.now() < until) { /* Windows の一時的なファイルロック待ち */ }
+      }
+    }
+  }
+
+  list() {
+    const raw = this._loadRaw();
+    return Object.keys(raw.agents).sort().map((name) => makeAgentProfile(name, raw.agents[name]));
+  }
+
+  get(name) {
+    const raw = this._loadRaw();
+    if (!Object.hasOwn(raw.agents, name)) {
+      const known = Object.keys(raw.agents).sort().join(", ") || "(なし)";
+      throw new ProfileError(`エージェント '${name}' が見つかりません。登録済み: ${known}`);
+    }
+    return makeAgentProfile(name, raw.agents[name]);
+  }
+
+  add(profile, overwrite = false) {
+    profile = makeAgentProfile(profile.name, profile);
+    const raw = this._loadRaw();
+    if (Object.hasOwn(raw.agents, profile.name) && !overwrite) {
+      throw new ProfileError(`エージェント '${profile.name}' は既に存在します`);
+    }
+    const { name, ...attrs } = profile;
+    raw.agents[name] = attrs;
+    this._saveRaw(raw);
+  }
+
+  addPairingFile(filePath, name = null, overwrite = false) {
+    const raw = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    if (raw.protocol !== 1) throw new ProfileError(`未対応のプロトコルです: ${raw.protocol}`);
+    const profile = makeAgentProfile(name || raw.name, raw);
+    this.add(profile, overwrite);
+    return profile;
+  }
+
+  remove(name) {
+    const raw = this._loadRaw();
+    if (!Object.hasOwn(raw.agents, name)) throw new ProfileError(`エージェント '${name}' が見つかりません`);
+    delete raw.agents[name];
     this._saveRaw(raw);
   }
 }

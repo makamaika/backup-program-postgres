@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS backups (
     archive_profile TEXT,           -- archive: 格納先プロファイル名
     archive_db TEXT,                -- archive: 格納先 DB 名
     archive_row_id INTEGER,         -- archive: pgbackup_archive.id
+    agent_profile TEXT,             -- agent: 格納先エージェント名
+    agent_backup_id TEXT,           -- agent: リモート保管庫の ID
     size INTEGER,
     sha256 TEXT,
     pg_dump_version TEXT,
@@ -47,6 +49,7 @@ function now() {
 
 const FINALIZE_FIELDS = new Set([
   "location", "archive_profile", "archive_db", "archive_row_id",
+  "agent_profile", "agent_backup_id",
   "size", "sha256", "pg_dump_version", "note",
 ]);
 
@@ -59,6 +62,12 @@ export class Catalog {
     const cols = this.db.prepare("PRAGMA table_info(backups)").all().map((r) => r.name);
     if (!cols.includes("status")) {
       this.db.exec("ALTER TABLE backups ADD COLUMN status TEXT NOT NULL DEFAULT 'done'");
+    }
+    if (!cols.includes("agent_profile")) {
+      this.db.exec("ALTER TABLE backups ADD COLUMN agent_profile TEXT");
+    }
+    if (!cols.includes("agent_backup_id")) {
+      this.db.exec("ALTER TABLE backups ADD COLUMN agent_backup_id TEXT");
     }
   }
 

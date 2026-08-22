@@ -10,6 +10,11 @@
   "bin": {
     "pgbackup-js": "bin/pgbackup.js"
   },
+  "files": [
+    "bin/",
+    "src/",
+    "README.md"
+  ],
   "scripts": {
     "start": "node bin/pgbackup.js",
     "web": "node bin/pgbackup.js web",

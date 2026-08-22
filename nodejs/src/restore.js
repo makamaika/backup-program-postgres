@@ -9,9 +9,10 @@ import fs from "node:fs";
 import path from "node:path";
 
 import * as archiveMod from "./archive.js";
+import { AgentClient } from "./agent.js";
 import * as pgtools from "./pgtools.js";
 import { sha256OfFile } from "./backup.js";
-import { tmpDir } from "./config.js";
+import { AgentProfileStore, tmpDir } from "./config.js";
 import { withReplaceDatabase } from "./db.js";
 import { RestoreError } from "./errors.js";
 
@@ -37,7 +38,7 @@ async function restoreDump(dest, destDb, dumpPath, fmt, keepOwner = false) {
 
 // カタログに登録されたバージョンを指定環境へ復元する
 export async function restoreVersion(catalog, profiles, versionId, dest, {
-  destDb = null, drop = false, keepOwner = false,
+  destDb = null, drop = false, keepOwner = false, agents = null,
 } = {}) {
   const rec = catalog.getBackup(versionId);
   destDb = destDb || rec.db;
@@ -69,6 +70,16 @@ export async function restoreVersion(catalog, profiles, versionId, dest, {
           `アーカイブ '${versionId}' の内容がカタログの記録と一致しません ` +
           "(sha256 不一致)。アーカイブが差し替えられた可能性があります。"
         );
+      }
+      dumpPath = fetchedTmp;
+    } else if (rec.mode === "agent") {
+      const agent = (agents || new AgentProfileStore()).get(rec.agent_profile);
+      fetchedTmp = path.join(
+        tmpDir(), `restore_${crypto.randomBytes(8).toString("hex")}.${rec.fmt === "plain" ? "sql" : "dump"}`
+      );
+      const meta = await new AgentClient(agent).downloadBackup(rec.agent_backup_id, fetchedTmp);
+      if (rec.sha256 && meta.sha256 !== rec.sha256) {
+        throw new RestoreError(`エージェントバックアップ '${versionId}' の SHA-256 が一致しません`);
       }
       dumpPath = fetchedTmp;
     } else {

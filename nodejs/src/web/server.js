@@ -11,12 +11,14 @@ import { fileURLToPath } from "node:url";
 import express from "express";
 
 import * as archiveMod from "../archive.js";
+import { AgentClient } from "../agent.js";
 import * as backupMod from "../backup.js";
 import * as inspectMod from "../inspect.js";
 import * as restoreMod from "../restore.js";
 import { Catalog } from "../catalog.js";
 import {
-  DEFAULT_ARCHIVE_DB, ProfileStore, cleanupTmp, makeProfile, profileMasked,
+  AgentProfileStore, DEFAULT_ARCHIVE_DB, ProfileStore, agentMasked, cleanupTmp,
+  makeAgentProfile, makeProfile, profileMasked,
 } from "../config.js";
 import { serverVersion } from "../db.js";
 import { PgBackupError } from "../errors.js";
@@ -91,8 +93,33 @@ function limitQ(req, fallback, max) {
 
 export function createApp() {
   const app = express();
+  const allowedHosts = new Set(
+    (process.env.PGBACKUP_WEB_ALLOWED_HOSTS || "127.0.0.1,localhost,::1")
+      .split(",").map((value) => value.trim().toLowerCase()).filter(Boolean)
+  );
+  app.disable("x-powered-by");
+  app.use((req, res, next) => {
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    if (req.path.startsWith("/api/")) res.setHeader("Cache-Control", "no-store");
+    if (!allowedHosts.has(String(req.hostname || "").toLowerCase())) {
+      res.status(400).json({ detail: "許可されていない Host ヘッダーです" });
+      return;
+    }
+    if (!["GET", "HEAD", "OPTIONS"].includes(req.method) && req.headers.origin) {
+      let originHost = "";
+      try { originHost = new URL(req.headers.origin).host.toLowerCase(); } catch { /* reject below */ }
+      if (!originHost || originHost !== String(req.headers.host || "").toLowerCase()) {
+        res.status(403).json({ detail: "異なる Origin からの操作は拒否されました" });
+        return;
+      }
+    }
+    next();
+  });
   app.use(express.json());
   const store = new ProfileStore();
+  const agents = new AgentProfileStore();
   const catalog = new Catalog();
   const jobs = new JobManager();
   cleanupTmp();
@@ -132,6 +159,57 @@ export function createApp() {
       if (!(e instanceof PgBackupError)) throw e;
       res.json({ ok: false, error: e.message });
     }
+  });
+
+  // ---- HTTPS バックアップエージェント ----
+
+  app.get("/api/agents", (req, res) => res.json(agents.list().map(agentMasked)));
+  app.post("/api/agents", (req, res) => {
+    const b = req.body ?? {};
+    agents.add(makeAgentProfile(String(b.name ?? ""), b), Boolean(b.overwrite));
+    res.json({ ok: true });
+  });
+  app.delete("/api/agents/:name", (req, res) => {
+    agents.remove(req.params.name);
+    res.json({ ok: true });
+  });
+  app.post("/api/agents/:name/test", async (req, res) => {
+    res.json(await new AgentClient(agents.get(req.params.name)).health());
+  });
+  app.get("/api/agent-backups", async (req, res) => {
+    res.json(await new AgentClient(agents.get(requireQ(req, "agent"))).listBackups(limitQ(req, 200, 1000)));
+  });
+  app.delete("/api/agent-backups/:id", async (req, res) => {
+    const agent = requireQ(req, "agent");
+    const result = await new AgentClient(agents.get(agent)).deleteBackup(req.params.id);
+    for (const rec of catalog.listBackups()) {
+      if (rec.agent_profile === agent && rec.agent_backup_id === req.params.id) {
+        catalog.deleteBackup(rec.version_id);
+      }
+    }
+    res.json(result);
+  });
+  app.get("/api/agent-databases", async (req, res) => {
+    res.json(await new AgentClient(agents.get(requireQ(req, "agent"))).databases(
+      requireQ(req, "remote_profile"), req.query.templates === "true"
+    ));
+  });
+  app.get("/api/agent-structure", async (req, res) => {
+    res.json(await new AgentClient(agents.get(requireQ(req, "agent"))).structure(
+      requireQ(req, "remote_profile"), requireQ(req, "db")
+    ));
+  });
+  app.get("/api/agent-table", async (req, res) => {
+    res.json(await new AgentClient(agents.get(requireQ(req, "agent"))).table(
+      requireQ(req, "remote_profile"), requireQ(req, "db"),
+      requireQ(req, "schema"), requireQ(req, "table")
+    ));
+  });
+  app.get("/api/agent-sample", async (req, res) => {
+    res.json(await new AgentClient(agents.get(requireQ(req, "agent"))).sample(
+      requireQ(req, "remote_profile"), requireQ(req, "db"),
+      requireQ(req, "schema"), requireQ(req, "table"), limitQ(req, 10, 100)
+    ));
   });
 
   // ---- データベース検査 ----
@@ -174,11 +252,12 @@ export function createApp() {
     const mode = b.mode || "file";
     const fmt = backupMod.checkModeOptions(mode, {
       fmt: b.fmt ?? null, dest: b.dest ?? null, destDb: b.dest_db ?? null,
-      drop: Boolean(b.drop), keepOwner: Boolean(b.keep_owner), nDbs: dbs.length,
+      agent: b.agent ?? null, drop: Boolean(b.drop), keepOwner: Boolean(b.keep_owner), nDbs: dbs.length,
     });
     let dest = null;
     if (mode === "clone") dest = store.get(b.dest);
     else if (mode === "archive") dest = b.dest ? store.get(b.dest) : source;
+    const agentProfile = mode === "agent" ? agents.get(b.agent) : null;
 
     const run = async (log) => {
       const results = [];
@@ -192,6 +271,10 @@ export function createApp() {
         } else if (mode === "archive") {
           r = await backupMod.backupToArchive(catalog, source, db, dest, {
             archiveDb, note: b.note ?? null,
+          });
+        } else if (mode === "agent") {
+          r = await backupMod.backupToAgent(catalog, source, db, agentProfile, {
+            fmt, note: b.note ?? null, keepOwner: Boolean(b.keep_owner),
           });
         } else {
           r = await backupMod.backupToFile(catalog, source, db, {
@@ -216,7 +299,7 @@ export function createApp() {
     const run = (log) => {
       log(`${b.version_id} を ${dest.name} に復元中`);
       return restoreMod.restoreVersion(catalog, store, b.version_id, dest, {
-        destDb: b.db ?? null, drop: Boolean(b.drop), keepOwner: Boolean(b.keep_owner),
+        destDb: b.db ?? null, drop: Boolean(b.drop), keepOwner: Boolean(b.keep_owner), agents,
       });
     };
     const title = `リストア: ${b.version_id} -> ${b.dest}:${b.db || rec.db}`;
@@ -249,6 +332,44 @@ export function createApp() {
     };
     const title = `アーカイブからリストア: ${b.version_id} -> ${b.dest}`;
     res.json({ job_id: jobs.submit("restore", title, run) });
+  });
+
+  app.post("/api/agent-pull", (req, res) => {
+    const b = req.body ?? {};
+    const agent = agents.get(String(b.agent ?? ""));
+    const run = (log) => {
+      log(`${b.agent}:${b.remote_profile}/${b.db} を手元へ取得中`);
+      return backupMod.backupAgentDatabaseToFile(catalog, agent, String(b.remote_profile ?? ""),
+        String(b.db ?? ""), {
+          fmt: b.fmt || "custom", note: b.note ?? null, keepOwner: Boolean(b.keep_owner),
+        });
+    };
+    res.json({ job_id: jobs.submit("backup", `エージェントから取得: ${b.agent}/${b.db}`, run) });
+  });
+
+  app.post("/api/agent-snapshot", (req, res) => {
+    const b = req.body ?? {};
+    const client = new AgentClient(agents.get(String(b.agent ?? "")));
+    const run = (log) => {
+      log(`${b.agent} 内で ${b.remote_profile}/${b.db} をスナップショット中`);
+      return client.createSnapshot(String(b.remote_profile ?? ""), String(b.db ?? ""), {
+        versionId: b.version_id ?? null, fmt: b.fmt || "custom",
+        keepOwner: Boolean(b.keep_owner), note: b.note ?? null,
+      });
+    };
+    res.json({ job_id: jobs.submit("backup", `エージェント内スナップショット: ${b.agent}/${b.db}`, run) });
+  });
+
+  app.post("/api/agent-remote-restore", (req, res) => {
+    const b = req.body ?? {};
+    const client = new AgentClient(agents.get(String(b.agent ?? "")));
+    const run = (log) => {
+      log(`${b.backup_id} を ${b.remote_profile}:${b.db || "(元DB名)"} に復元中`);
+      return client.restoreRemoteBackup(String(b.backup_id ?? ""), String(b.remote_profile ?? ""), {
+        destDb: b.db ?? null, drop: Boolean(b.drop), keepOwner: Boolean(b.keep_owner),
+      });
+    };
+    res.json({ job_id: jobs.submit("restore", `エージェント側リストア: ${b.agent}:${b.backup_id}`, run) });
   });
 
   // ---- バージョン / アーカイブ / 履歴 ----

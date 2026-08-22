@@ -1,9 +1,10 @@
 """バックアップエンジン。
 
-3 つのモードを提供する:
+4 つのモードを提供する:
   - file    : pg_dump でファイルに出力 (SQL またはカスタム形式) + バージョン登録
   - archive : 格納先サーバーの BACK_UP_DB にダンプを保存 + バージョン登録
   - clone   : pg_dump | pg_restore でそのまま別 DB に複製 (ローカル/リモートの任意の組合せ)
+  - agent   : pg_dump の結果を HTTPS バックアップエージェントへ保存
 """
 
 from __future__ import annotations
@@ -16,6 +17,8 @@ from pathlib import Path
 
 from . import archive as archive_mod
 from . import pgtools
+from .agent.client import AgentClient
+from .agent.config import AgentProfile
 from .catalog import Catalog
 from .config import DEFAULT_ARCHIVE_DB, Profile, backups_dir, tmp_dir
 from .db import database_encoding, replace_database, same_cluster, server_version
@@ -65,6 +68,7 @@ def check_mode_options(
     out: str | None = None,
     dest: str | None = None,
     dest_db: str | None = None,
+    agent: str | None = None,
     drop: bool = False,
     keep_owner: bool = False,
     n_dbs: int = 1,
@@ -73,11 +77,12 @@ def check_mode_options(
 
     戻り値は解決済みの fmt。無効な指定は黙って無視せずエラーにする。
     """
-    if mode not in ("file", "archive", "clone"):
+    if mode not in ("file", "archive", "clone", "agent"):
         raise BackupError(f"不明なモード: {mode}")
-    if mode != "file":
+    if mode not in ("file", "agent"):
         if fmt is not None:
-            raise BackupError(f"--fmt は file モード専用です (mode={mode})")
+            raise BackupError(f"--fmt は file / agent モード専用です (mode={mode})")
+    if mode != "file":
         if out:
             raise BackupError(f"--out は file モード専用です (mode={mode})")
     if mode != "clone":
@@ -88,10 +93,14 @@ def check_mode_options(
     if mode == "archive" and keep_owner:
         raise BackupError("--keep-owner は archive モードでは指定できません "
                           "(復元時 'restore --keep-owner' で指定します)")
-    if mode == "file" and dest:
+    if mode in ("file", "agent") and dest:
         raise BackupError("--dest は archive / clone モード専用です")
     if mode == "clone" and not dest:
         raise BackupError("clone モードでは --dest (複製先プロファイル) が必須です")
+    if mode == "agent" and not agent:
+        raise BackupError("agent モードでは --agent (保存先エージェント) が必須です")
+    if mode != "agent" and agent:
+        raise BackupError("--agent は agent モード専用です")
     if dest_db and n_dbs > 1:
         raise BackupError("--dest-db は対象 DB が 1 つのときのみ指定できます")
     if mode == "file" and out and n_dbs > 1:
@@ -101,7 +110,7 @@ def check_mode_options(
                 "--out にファイルパスを指定した場合、対象 DB は 1 つだけにしてください "
                 "(複数 DB はディレクトリを指定)"
             )
-    resolved_fmt = fmt or "plain"
+    resolved_fmt = fmt or ("custom" if mode == "agent" else "plain")
     if resolved_fmt not in ("plain", "custom"):
         raise BackupError(f"不明なフォーマット: {resolved_fmt} (plain または custom)")
     return resolved_fmt
@@ -244,6 +253,138 @@ def backup_to_archive(
         f"archive バックアップ: {rec['version_id']} -> {dest.name}:{archive_db}",
         {"version_id": rec["version_id"], "mode": "archive",
          "dest": dest.name, "archive_db": archive_db},
+    )
+    return rec
+
+
+def backup_to_agent(
+    catalog: Catalog,
+    source: Profile,
+    db: str,
+    agent: AgentProfile,
+    *,
+    fmt: str = "custom",
+    note: str | None = None,
+    keep_owner: bool = False,
+) -> dict:
+    """ローカル接続できる DB をダンプし、HTTPS エージェントへ安全に保存する。"""
+    if fmt not in ("plain", "custom"):
+        raise BackupError(f"不明なフォーマット: {fmt} (plain または custom)")
+    rec = catalog.reserve_version(source.name, db, mode="agent", fmt=fmt)
+    suffix = ".sql" if fmt == "plain" else ".dump"
+    temp_path = tmp_dir() / f"agent_upload_{uuid.uuid4().hex}{suffix}"
+    remote_id: str | None = None
+    client = AgentClient(agent)
+    try:
+        pgtools.dump_to_file(source, db, temp_path, fmt=fmt, keep_owner=keep_owner)
+        digest = sha256_of_file(temp_path)
+        remote = client.upload_backup(
+            temp_path,
+            version_id=rec["version_id"],
+            source_profile=source.name,
+            source_db=db,
+            fmt=fmt,
+            sha256=digest,
+            note=note,
+        )
+        remote_id = remote["id"]
+        rec = catalog.finalize_backup(
+            rec["id"],
+            agent_profile=agent.name,
+            agent_backup_id=remote_id,
+            size=temp_path.stat().st_size,
+            sha256=digest,
+            pg_dump_version=pgtools.pg_dump_version(),
+            note=note,
+        )
+    except Exception as exc:
+        if remote_id is not None:
+            try:
+                client.delete_backup(remote_id)
+            except Exception:
+                pass
+        catalog.abort_backup(rec["id"])
+        catalog.log_operation(
+            "backup",
+            False,
+            f"agent バックアップ失敗: {source.name}/{db}: {exc}",
+            {"profile": source.name, "db": db, "mode": "agent", "agent": agent.name},
+        )
+        raise
+    finally:
+        temp_path.unlink(missing_ok=True)
+    catalog.log_operation(
+        "backup",
+        True,
+        f"agent バックアップ: {rec['version_id']} -> {agent.name}:{remote_id}",
+        {
+            "version_id": rec["version_id"],
+            "mode": "agent",
+            "agent": agent.name,
+            "agent_backup_id": remote_id,
+        },
+    )
+    return rec
+
+
+def backup_agent_database_to_file(
+    catalog: Catalog,
+    agent: AgentProfile,
+    remote_profile: str,
+    db: str,
+    *,
+    fmt: str = "custom",
+    out: Path | None = None,
+    note: str | None = None,
+    keep_owner: bool = False,
+) -> dict:
+    """エージェント端末のローカル PostgreSQL をダンプし、手元へ保存する。"""
+    if fmt not in ("plain", "custom"):
+        raise BackupError(f"不明なフォーマット: {fmt} (plain または custom)")
+    rec = catalog.reserve_version(agent.name, db, mode="file", fmt=fmt)
+    out_path: Path | None = None
+    try:
+        out_path = _resolve_out_path(out, agent, db, rec["version_no"], fmt)
+        meta = AgentClient(agent).download_database(
+            remote_profile,
+            db,
+            out_path,
+            fmt=fmt,
+            keep_owner=keep_owner,
+        )
+        rec = catalog.finalize_backup(
+            rec["id"],
+            location=str(out_path.resolve()),
+            size=meta["size"],
+            sha256=meta["sha256"],
+            note=note,
+        )
+    except Exception as exc:
+        if out_path is not None:
+            out_path.unlink(missing_ok=True)
+        catalog.abort_backup(rec["id"])
+        catalog.log_operation(
+            "backup",
+            False,
+            f"agent pull 失敗: {agent.name}/{remote_profile}/{db}: {exc}",
+            {
+                "agent": agent.name,
+                "remote_profile": remote_profile,
+                "db": db,
+                "mode": "agent-pull",
+            },
+        )
+        raise
+    catalog.log_operation(
+        "backup",
+        True,
+        f"agent pull: {rec['version_id']} <- {agent.name}:{remote_profile}/{db}",
+        {
+            "version_id": rec["version_id"],
+            "agent": agent.name,
+            "remote_profile": remote_profile,
+            "location": str(out_path),
+        },
     )
     return rec
 

@@ -1,15 +1,17 @@
 // バックアップエンジン。
 //
-// 3 つのモードを提供する:
+// 4 つのモードを提供する:
 //   - file    : pg_dump でファイルに出力 (SQL またはカスタム形式) + バージョン登録
 //   - archive : 格納先サーバーの BACK_UP_DB にダンプを保存 + バージョン登録
 //   - clone   : pg_dump | pg_restore でそのまま別 DB に複製 (ローカル/リモートの任意の組合せ)
+//   - agent   : pg_dump の結果を HTTPS バックアップエージェントへ保存
 
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
 import * as archiveMod from "./archive.js";
+import { AgentClient } from "./agent.js";
 import * as pgtools from "./pgtools.js";
 import { DEFAULT_ARCHIVE_DB, backupsDir, profileDisplay, tmpDir } from "./config.js";
 import { databaseEncoding, sameCluster, serverVersion, withReplaceDatabase } from "./db.js";
@@ -59,13 +61,15 @@ export async function checkDumpCompat(source) {
 // 戻り値は解決済みの fmt。無効な指定は黙って無視せずエラーにする。
 export function checkModeOptions(mode, {
   fmt = null, out = null, dest = null, destDb = null,
-  drop = false, keepOwner = false, nDbs = 1,
+  agent = null, drop = false, keepOwner = false, nDbs = 1,
 } = {}) {
-  if (!["file", "archive", "clone"].includes(mode)) {
+  if (!["file", "archive", "clone", "agent"].includes(mode)) {
     throw new BackupError(`不明なモード: ${mode}`);
   }
+  if (!["file", "agent"].includes(mode)) {
+    if (fmt !== null) throw new BackupError(`--fmt は file / agent モード専用です (mode=${mode})`);
+  }
   if (mode !== "file") {
-    if (fmt !== null) throw new BackupError(`--fmt は file モード専用です (mode=${mode})`);
     if (out) throw new BackupError(`--out は file モード専用です (mode=${mode})`);
   }
   if (mode !== "clone") {
@@ -75,8 +79,10 @@ export function checkModeOptions(mode, {
   if (mode === "archive" && keepOwner) {
     throw new BackupError("--keep-owner は archive モードでは指定できません (復元時 'restore --keep-owner' で指定します)");
   }
-  if (mode === "file" && dest) throw new BackupError("--dest は archive / clone モード専用です");
+  if (["file", "agent"].includes(mode) && dest) throw new BackupError("--dest は archive / clone モード専用です");
   if (mode === "clone" && !dest) throw new BackupError("clone モードでは --dest (複製先プロファイル) が必須です");
+  if (mode === "agent" && !agent) throw new BackupError("agent モードでは --agent が必須です");
+  if (mode !== "agent" && agent) throw new BackupError("--agent は agent モード専用です");
   if (destDb && nDbs > 1) throw new BackupError("--dest-db は対象 DB が 1 つのときのみ指定できます");
   if (mode === "file" && out && nDbs > 1) {
     const isDir = (fs.existsSync(out) && fs.statSync(out).isDirectory()) || /[\\/]$/.test(String(out));
@@ -86,7 +92,7 @@ export function checkModeOptions(mode, {
       );
     }
   }
-  const resolved = fmt ?? "plain";
+  const resolved = fmt ?? (mode === "agent" ? "custom" : "plain");
   if (!["plain", "custom"].includes(resolved)) {
     throw new BackupError(`不明なフォーマット: ${resolved} (plain または custom)`);
   }
@@ -210,6 +216,72 @@ export async function backupToArchive(catalog, source, db, dest, {
   catalog.logOperation("backup", true,
     `archive バックアップ: ${rec.version_id} -> ${dest.name}:${archiveDb}`,
     { version_id: rec.version_id, mode: "archive", dest: dest.name, archive_db: archiveDb });
+  return rec;
+}
+
+export async function backupToAgent(catalog, source, db, agent, {
+  fmt = "custom", note = null, keepOwner = false,
+} = {}) {
+  if (!["plain", "custom"].includes(fmt)) throw new BackupError(`不明なフォーマット: ${fmt}`);
+  let rec = catalog.reserveVersion(source.name, db, "agent", fmt);
+  const ext = fmt === "plain" ? "sql" : "dump";
+  const tmpPath = path.join(tmpDir(), `agent_upload_${crypto.randomBytes(8).toString("hex")}.${ext}`);
+  const client = new AgentClient(agent);
+  let remoteId = null;
+  try {
+    await pgtools.dumpToFile(source, db, tmpPath, fmt, keepOwner);
+    const digest = await sha256OfFile(tmpPath);
+    const remote = await client.uploadBackup(tmpPath, {
+      versionId: rec.version_id, sourceProfile: source.name, sourceDb: db,
+      fmt, sha256: digest, note,
+    });
+    remoteId = remote.id;
+    rec = catalog.finalizeBackup(rec.id, {
+      agent_profile: agent.name,
+      agent_backup_id: remoteId,
+      size: fs.statSync(tmpPath).size,
+      sha256: digest,
+      pg_dump_version: pgtools.pgDumpVersion(),
+      note,
+    });
+  } catch (e) {
+    if (remoteId !== null) {
+      try { await client.deleteBackup(remoteId); } catch { /* best effort rollback */ }
+    }
+    catalog.abortBackup(rec.id);
+    catalog.logOperation("backup", false, `agent バックアップ失敗: ${source.name}/${db}: ${e.message}`,
+      { profile: source.name, db, mode: "agent", agent: agent.name });
+    throw e;
+  } finally {
+    fs.rmSync(tmpPath, { force: true });
+  }
+  catalog.logOperation("backup", true, `agent バックアップ: ${rec.version_id} -> ${agent.name}:${remoteId}`,
+    { version_id: rec.version_id, mode: "agent", agent: agent.name, agent_backup_id: remoteId });
+  return rec;
+}
+
+export async function backupAgentDatabaseToFile(catalog, agent, remoteProfile, db, {
+  fmt = "custom", out = null, note = null, keepOwner = false,
+} = {}) {
+  let rec = catalog.reserveVersion(agent.name, db, "file", fmt);
+  let outPath = null;
+  try {
+    outPath = resolveOutPath(out, agent, db, rec.version_no, fmt);
+    const meta = await new AgentClient(agent).downloadDatabase(remoteProfile, db, outPath, {
+      fmt, keepOwner,
+    });
+    rec = catalog.finalizeBackup(rec.id, {
+      location: path.resolve(outPath), size: meta.size, sha256: meta.sha256, note,
+    });
+  } catch (e) {
+    if (outPath !== null) fs.rmSync(outPath, { force: true });
+    catalog.abortBackup(rec.id);
+    catalog.logOperation("backup", false, `agent pull 失敗: ${agent.name}/${remoteProfile}/${db}: ${e.message}`,
+      { agent: agent.name, remote_profile: remoteProfile, db, mode: "agent-pull" });
+    throw e;
+  }
+  catalog.logOperation("backup", true, `agent pull: ${rec.version_id} <- ${agent.name}:${remoteProfile}/${db}`,
+    { version_id: rec.version_id, agent: agent.name, remote_profile: remoteProfile, location: outPath });
   return rec;
 }
 

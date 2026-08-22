@@ -21,6 +21,7 @@ PostgreSQL データベースのバックアップ・複製・リストアを **
 | 構造の確認 | スキーマ / テーブル / カラム定義 / インデックス / データのサンプル / 保存されているデータ型の内訳 |
 | ファイルバックアップ | pg_dump で SQL ファイル (`.sql`) またはカスタム形式 (`.dump`) に出力 |
 | アーカイブバックアップ | 指定サーバー上に **BACK_UP_DB** を自動作成し、すべてのバックアップを 1 つの DB に蓄積 |
+| HTTPS バックアップエージェント | PostgreSQL のポートを公開せず、一時起動した専用 HTTPS サーバー経由で別端末へ保存・取得・任意で復元 |
 | 複製 (クローン) | DB をそのまま別 DB として複製。**リモート→ローカル / ローカル→リモート / ローカル→ローカル / リモート→リモート** の全方向に対応 |
 | 対象の選択 | 指定した DB のみ、複数 DB、または全 DB (`--all`) をバックアップ |
 | リストア | バージョン ID・アーカイブ・ダンプファイルのいずれからでも、任意のサーバー / 任意の DB 名へ復元 |
@@ -101,6 +102,8 @@ pgbackup backup remote --db shop_db --mode clone --dest local
 pgbackup backup local --db shop_db --mode clone --dest local --dest-db shop_db_copy
 #    (f) 全 DB を一括バックアップ
 pgbackup backup remote --all --mode archive --dest local
+#    (g) PostgreSQL を外部公開せず、別端末のエージェントへ保存
+pgbackup backup local --db shop_db --mode agent --agent backup-pc
 
 # 5. バージョン一覧
 pgbackup versions
@@ -128,10 +131,12 @@ pgbackup web --port 9000
 ブラウザから以下が行えます:
 
 - **接続**: プロファイルの追加 / 削除 / 接続テスト
+- **バックアップエージェント**: pairing bundle の登録、リモート保管庫、
+  エージェント端末の DB 一覧・取得・スナップショット・復元
 - **データベース**: DB 一覧 → 構造ビューア
   (スキーマツリー、カラム定義・型・PK・インデックス、データのサンプル表示、
   DB に保存されているデータ型の内訳)
-- **バックアップ**: file / archive / clone を画面から実行 (進捗は右下のジョブパネル)
+- **バックアップ**: file / archive / clone / agent を画面から実行 (進捗は右下のジョブパネル)
 - **バージョン・リストア**: バージョン一覧・アーカイブの中身・ダンプファイルからのリストア
 - **履歴**: 全操作の記録
 
@@ -143,10 +148,74 @@ pgbackup web --port 9000
 | `file` (custom) | `.dump` ファイル | 圧縮・高速リストア |
 | `archive` | 指定サーバーの `BACK_UP_DB` | バックアップを 1 箇所の DB に集約管理 (チャンク分割 bytea + sha256) |
 | `clone` | 新しい DB | 検証環境の複製・移行。DB をそのままコピー |
+| `agent` | 別端末のファイル保管庫 | PostgreSQL のリモート接続を有効にせず、HTTPS でバックアップを転送 |
+
+## PostgreSQL を公開しない HTTPS バックアップエージェント
+
+通常、別端末から PostgreSQL へ直接接続するには `listen_addresses` と `pg_hba.conf`、
+OS ファイアウォールを変更する必要があります。エージェント方式では PostgreSQL は
+`localhost` のままにし、対象端末上の `pgbackup agent serve` だけを必要な時間だけ起動します。
+
+### 1. バックアップ先／DB端末で初期化
+
+`--public-url` のホスト名または IP は、操作元端末から実際に接続する名前と一致させます。
+
+```bash
+pgbackup agent init \
+  --name backup-pc \
+  --public-url https://192.168.1.50:8510 \
+  --max-upload-gib 100 \
+  --max-storage-gib 500
+```
+
+生成物:
+
+- `~/.pgbackup/agent/server.json`: サーバー設定。トークンは SHA-256 ハッシュだけを保持
+- `agent-cert.pem` / `agent-key.pem`: 自己署名 TLS 証明書と秘密鍵
+- `pairing-backup-pc.json`: 接続 URL・秘密トークン・信頼する証明書を含む一時ファイル
+- `storage/agent.db`: 保管メタデータだけを保持する SQLite
+- `storage/objects/*.dump`: ダンプ本体。巨大 BLOB を SQLite に入れず、ファイルとして保存
+
+リモート側 PostgreSQL の一覧・ダンプ取得も許可する場合だけ `--allow-db-read`、
+保管済みダンプをリモート側 PostgreSQL へ戻す場合だけ `--allow-db-restore` を追加します。
+**復元権限は既定で無効**です。
+
+### 2. 一時サーバーを起動
+
+```bash
+# 127.0.0.1 はローカルテスト用。LAN の別端末から接続するときだけ 0.0.0.0 を明示
+pgbackup agent serve --host 0.0.0.0 --port 8510
+```
+
+### 3. 操作元へ pairing bundle を安全に渡して登録
+
+USB、既存の SSH/SCP、暗号化済みメッセンジャーなどで `pairing-backup-pc.json` を一度だけ渡します。
+
+```bash
+pgbackup agent add pairing-backup-pc.json
+pgbackup agent test backup-pc
+
+# 手元の PostgreSQL → 別端末の保管庫
+pgbackup backup local --db shop_db --mode agent --agent backup-pc
+
+# エージェント端末の PostgreSQL → 手元のファイル
+pgbackup agent dbs backup-pc --remote-profile local
+pgbackup agent pull backup-pc --remote-profile local --db shop_db
+
+# エージェント端末内で直接 snapshot (ネットワークへダンプ本体を往復させない)
+pgbackup agent snapshot backup-pc --remote-profile local --db shop_db
+
+# 保管済みバックアップをエージェント端末の PostgreSQL へ戻す
+pgbackup agent backups backup-pc
+pgbackup agent restore backup-pc BACKUP_ID --remote-profile local --db shop_db_restored
+```
+
+登録後は `pairing-backup-pc.json` を安全に削除し、作業終了後はサーバーを `Ctrl+C` で停止します。
+通常の `pgbackup restore <version-id>` は、`agent` モードのバージョンも自動取得して復元できます。
 
 ## バージョン管理の仕組み
 
-- すべての file / archive バックアップは `PGBACKUP_HOME/catalog.db` (SQLite) に登録されます
+- すべての file / archive / agent バックアップは `PGBACKUP_HOME/catalog.db` (SQLite) に登録されます
 - バージョン ID: `<プロファイル>/<DB名>@v<連番>` (DB ごとに v1, v2, … と増加)
 - 各バックアップに sha256 / サイズ / pg_dump バージョン / メモを記録し、
   リストア時に sha256 で破損チェックを行います
@@ -160,6 +229,7 @@ pgbackup web --port 9000
 ```
 ~/.pgbackup/
 ├── connections.json   # 接続プロファイル (パスワードを含む — 権限に注意)
+├── agents.json        # pairing 済みエージェント (秘密トークン + 固定 CA 証明書)
 ├── catalog.db         # バージョンカタログ + 操作履歴 (SQLite)
 ├── backups/           # file モードの既定出力先 (プロファイル/DB別)
 └── tmp/               # アーカイブ転送時の一時ファイル
@@ -171,7 +241,23 @@ pgbackup web --port 9000
   でください (`.gitignore` 済み)。パスワードを保存したくない場合は `--password` を
   省略し、`PGPASSWORD` 環境変数や `~/.pgpass` を利用してください
 - Web UI は既定で `127.0.0.1` のみにバインドされ、認証はありません。
-  `--host 0.0.0.0` での公開はしないでください
+  `--host 0.0.0.0` での公開はしないでください。DNS rebinding / CSRF 対策として Host は
+  `127.0.0.1,localhost,::1`、変更系APIは同一Originだけを既定で許可します。特殊な構成で
+  追加Hostが必要な場合のみ `PGBACKUP_WEB_ALLOWED_HOSTS` をカンマ区切りで設定してください
+- バックアップエージェントは PostgreSQL より狭い専用 API ですが、ネットワークサービスである
+  ことに変わりはありません。インターネットへ直接ポート開放せず、同一 LAN、VPN
+  (WireGuard/Tailscale 等)、または SSH トンネル内で利用し、ファイアウォールで操作元 IP のみに
+  制限してください。必要な時間だけ起動し、終了後は停止してください
+- エージェント通信は TLS 1.2 以上、pairing bundle に含まれる証明書の固定、ランダムな
+  384bit 相当の Bearer token、認証失敗レート制限で保護します。HTTP URL、別証明書、
+  不正トークン、容量超過、SHA-256 不一致は拒否します
+- `pairing-*.json` と `agents.json` は秘密トークンを含みます。共有・コミットせず、OS の
+  ユーザー権限で保護してください。エージェント側の `agent-key.pem` も秘密情報です
+- エージェントのダンプ本体は保存先ディスク上では暗号化されません。機密 DB の場合は
+  BitLocker/LUKS/FileVault 等のディスク暗号化、アクセス権、物理保護を併用してください
+- `--allow-db-restore` は有効なトークン保有者に DB 入替権限を与えるため、必要なときだけ有効にします
+- エージェント側へのリモート復元は `custom` (`PGDMP`) 形式だけを許可します。plain SQL は
+  `psql` のメタコマンドで OS コマンドを実行し得るため、ネットワーク越しには復元しません
 - 複製および plain 形式のバックアップは既定で `--no-owner --no-privileges` 相当で
   実行します (復元先にロールがなくても失敗しない)。所有者情報も含める場合は
   `--keep-owner`
@@ -205,8 +291,9 @@ pg_ctl -D C:\tmp\pgB -o "-p 55433" start
 # (tests/e2e_cli.py 冒頭のコメント参照。shop_db 等のシードが必要)
 
 $env:PGBACKUP_HOME = "C:\tmp\pghome"
-python tests\e2e_cli.py   # CLI  : 27 テスト
-python tests\e2e_web.py   # Web  : 14 テスト
+python tests\e2e_cli.py   # Python CLI
+python tests\e2e_web.py   # Python Web: 16 テスト
+python tests\e2e_agent.py # HTTPS agent + Python/Node/Web 相互運用: 15 テスト
 ```
 
 ## ライセンス
@@ -225,9 +312,15 @@ pgbackup/
 ├── inspect.py   # DB 一覧・構造・データ型内訳・サンプル取得
 ├── catalog.py   # バージョンカタログ + 操作履歴 (SQLite)
 ├── archive.py   # BACK_UP_DB への格納 (16MB チャンク bytea + sha256)
-├── backup.py    # file / archive / clone の各バックアップモード
+├── backup.py    # file / archive / clone / agent の各バックアップモード
 ├── restore.py   # バージョン / ファイル / アーカイブからのリストア
 ├── cli.py       # CLI (argparse)
+├── agent/
+│   ├── certs.py  # 自己署名 TLS 証明書
+│   ├── config.py # サーバー設定・pairing・agents.json
+│   ├── store.py  # SQLite メタデータ + content-addressed ダンプ保管
+│   ├── client.py # 証明書固定 HTTPS クライアント
+│   └── server.py # 認証・容量制限付き FastAPI エージェント
 └── web/
     ├── server.py        # FastAPI + バックグラウンドジョブ
     └── static/index.html # SPA (vanilla JS)

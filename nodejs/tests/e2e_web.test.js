@@ -5,6 +5,7 @@
 
 import assert from "node:assert";
 import { spawn } from "node:child_process";
+import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -35,6 +36,19 @@ async function api(pathname, { body = null, method = null, raw = false } = {}) {
     throw err;
   }
   return raw ? res.text() : res.json();
+}
+
+function rawStatus(pathname, { method = "GET", headers = {}, body = null } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: "127.0.0.1", port: PORT, path: pathname, method, headers,
+    }, (res) => {
+      res.resume();
+      res.on("end", () => resolve(res.statusCode));
+    });
+    req.on("error", reject);
+    req.end(body);
+  });
 }
 
 async function waitJob(jobId, timeoutMs = 120_000) {
@@ -106,6 +120,13 @@ async function main() {
       const names = new Set(profiles.map((p) => p.name));
       assert.ok(names.has("local") && names.has("remote"));
       for (const p of profiles) assert.ok(p.password === null || p.password === "********");
+    });
+
+    await check("GET /api/agents は秘密情報を返さない", async () => {
+      for (const agent of await api("/api/agents")) {
+        assert.strictEqual(agent.token, "********");
+        assert.ok(!("ca_cert" in agent));
+      }
     });
 
     await check("POST /api/profiles/{name}/test", async () => {
@@ -214,6 +235,17 @@ async function main() {
         api("/api/profiles", { body: { name: "badport_web", host: "x", port: "55x32" } }),
         (e) => e.status === 400
       );
+    });
+
+    await check("セキュリティ: 不正 Host / 異なる Origin を拒否", async () => {
+      assert.strictEqual(await rawStatus("/api/profiles", {
+        headers: { Host: "evil.example" },
+      }), 400);
+      assert.strictEqual(await rawStatus("/api/profiles/local/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Origin: "https://evil.example" },
+        body: "{}",
+      }), 403);
     });
   } finally {
     server.kill();

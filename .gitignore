@@ -11,8 +11,17 @@ build/
 # Runtime data (connection profiles contain passwords - never commit)
 pgbackup_home/
 connections.json
+agents.json
 catalog.db
+agent.db
 *.dump
+*.part
+pairing-*.json
+agent-key.pem
+agent-cert.pem
+.pgbackup/
+/agent/
+.tmp-*/
 backups/
 
 # OS

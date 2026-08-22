@@ -12,6 +12,8 @@ from pathlib import Path
 
 from . import archive as archive_mod
 from . import pgtools
+from .agent.client import AgentClient
+from .agent.config import AgentProfileStore
 from .backup import sha256_of_file
 from .catalog import Catalog
 from .config import Profile, ProfileStore, tmp_dir
@@ -43,6 +45,7 @@ def restore_version(
     dest_db: str | None = None,
     drop: bool = False,
     keep_owner: bool = False,
+    agents: AgentProfileStore | None = None,
 ) -> dict:
     """カタログに登録されたバージョンを指定環境へ復元する。"""
     rec = catalog.get_backup(version_id)
@@ -74,6 +77,18 @@ def restore_version(
                 raise RestoreError(
                     f"アーカイブ '{version_id}' の内容がカタログの記録と一致しません "
                     "(sha256 不一致)。アーカイブが差し替えられた可能性があります。"
+                )
+            dump_path = fetched_tmp
+        elif rec["mode"] == "agent":
+            agent_store = agents or AgentProfileStore()
+            agent = agent_store.get(rec["agent_profile"])
+            suffix = ".sql" if rec["fmt"] == "plain" else ".dump"
+            fetched_tmp = tmp_dir() / f"restore_{uuid.uuid4().hex}{suffix}"
+            meta = AgentClient(agent).download_backup(rec["agent_backup_id"], fetched_tmp)
+            if rec.get("sha256") and meta.get("sha256") != rec["sha256"]:
+                raise RestoreError(
+                    f"エージェントバックアップ '{version_id}' の SHA-256 が"
+                    "カタログの記録と一致しません"
                 )
             dump_path = fetched_tmp
         else:

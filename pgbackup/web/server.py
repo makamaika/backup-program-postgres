@@ -6,14 +6,17 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel
 
 from .. import archive as archive_mod
@@ -21,6 +24,8 @@ from .. import backup as backup_mod
 from .. import config
 from .. import inspect as inspect_mod
 from .. import restore as restore_mod
+from ..agent.client import AgentClient
+from ..agent.config import AgentProfile, AgentProfileStore
 from ..catalog import Catalog
 from ..config import DEFAULT_ARCHIVE_DB, Profile, ProfileStore
 from ..db import server_version
@@ -103,6 +108,7 @@ class BackupIn(BaseModel):
     mode: str = "file"  # file | archive | clone
     fmt: str | None = None
     dest: str | None = None
+    agent: str | None = None
     dest_db: str | None = None
     archive_db: str = DEFAULT_ARCHIVE_DB
     drop: bool = False
@@ -136,14 +142,78 @@ class ArchiveRestoreIn(BaseModel):
     keep_owner: bool = False
 
 
+class AgentIn(BaseModel):
+    name: str
+    url: str
+    token: str
+    ca_cert: str
+    overwrite: bool = False
+
+
+class AgentPullIn(BaseModel):
+    agent: str
+    remote_profile: str
+    db: str
+    fmt: str = "custom"
+    keep_owner: bool = False
+    note: str | None = None
+
+
+class AgentSnapshotIn(AgentPullIn):
+    version_id: str | None = None
+
+
+class AgentRemoteRestoreIn(BaseModel):
+    agent: str
+    backup_id: str
+    remote_profile: str
+    db: str | None = None
+    drop: bool = False
+    keep_owner: bool = False
+
+
 # ---------------------------------------------------------------- アプリ本体
 
 def create_app() -> FastAPI:
     app = FastAPI(title="pgbackup", docs_url="/api/docs")
+    allowed_hosts = [
+        host.strip()
+        for host in os.environ.get(
+            "PGBACKUP_WEB_ALLOWED_HOSTS", "127.0.0.1,localhost,::1"
+        ).split(",")
+        if host.strip()
+    ]
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
     store = ProfileStore()
+    agents = AgentProfileStore()
     catalog = Catalog()
     jobs = JobManager()
     config.cleanup_tmp()
+
+    @app.middleware("http")
+    async def same_origin_guard(request: Request, call_next):
+        if request.method not in ("GET", "HEAD", "OPTIONS"):
+            origin = request.headers.get("origin")
+            if origin:
+                try:
+                    origin_host = urlparse(origin).netloc.lower()
+                except ValueError:
+                    origin_host = ""
+                request_host = request.headers.get("host", "").lower()
+                if not origin_host or origin_host != request_host:
+                    response = JSONResponse(
+                        status_code=403,
+                        content={"detail": "異なる Origin からの操作は拒否されました"},
+                    )
+                    response.headers["Cache-Control"] = "no-store"
+                    return response
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.exception_handler(PgBackupError)
     async def _pgbackup_error(request: Request, exc: PgBackupError):
@@ -183,6 +253,75 @@ def create_app() -> FastAPI:
         except PgBackupError as e:
             return {"ok": False, "error": str(e)}
 
+    # ---- HTTPS バックアップエージェント ----
+
+    @app.get("/api/agents")
+    def list_agents():
+        return [profile.to_dict(mask_token=True) for profile in agents.list()]
+
+    @app.post("/api/agents")
+    def add_agent(body: AgentIn):
+        agents.add(
+            AgentProfile(
+                name=body.name,
+                url=body.url,
+                token=body.token,
+                ca_cert=body.ca_cert,
+            ),
+            overwrite=body.overwrite,
+        )
+        return {"ok": True}
+
+    @app.delete("/api/agents/{name}")
+    def remove_agent(name: str):
+        agents.remove(name)
+        return {"ok": True}
+
+    @app.post("/api/agents/{name}/test")
+    def test_agent(name: str):
+        return AgentClient(agents.get(name)).health()
+
+    @app.get("/api/agent-backups")
+    def agent_backups(agent: str, limit: int = 200):
+        return AgentClient(agents.get(agent)).list_backups(limit=limit)
+
+    @app.delete("/api/agent-backups/{backup_id}")
+    def delete_agent_backup(backup_id: str, agent: str):
+        result = AgentClient(agents.get(agent)).delete_backup(backup_id)
+        for rec in catalog.list_backups():
+            if rec.get("agent_profile") == agent and rec.get("agent_backup_id") == backup_id:
+                catalog.delete_backup(rec["version_id"])
+        return result
+
+    @app.get("/api/agent-databases")
+    def agent_databases(agent: str, remote_profile: str, templates: bool = False):
+        return AgentClient(agents.get(agent)).databases(remote_profile, templates)
+
+    @app.get("/api/agent-structure")
+    def agent_structure(agent: str, remote_profile: str, db: str):
+        return AgentClient(agents.get(agent)).structure(remote_profile, db)
+
+    @app.get("/api/agent-table")
+    def agent_table(
+        agent: str, remote_profile: str, db: str, schema: str, table: str
+    ):
+        return AgentClient(agents.get(agent)).table(
+            remote_profile, db, schema, table
+        )
+
+    @app.get("/api/agent-sample")
+    def agent_sample(
+        agent: str,
+        remote_profile: str,
+        db: str,
+        schema: str,
+        table: str,
+        limit: int = 10,
+    ):
+        return AgentClient(agents.get(agent)).sample(
+            remote_profile, db, schema, table, limit
+        )
+
     # ---- データベース検査 ----
     # DB / スキーマ / テーブル名は '/' 等を含み得るためパスではなくクエリで受ける
 
@@ -216,12 +355,15 @@ def create_app() -> FastAPI:
         )
         fmt = backup_mod.check_mode_options(
             body.mode, fmt=body.fmt, dest=body.dest, dest_db=body.dest_db,
-            drop=body.drop, keep_owner=body.keep_owner, n_dbs=len(dbs),
+            agent=body.agent, drop=body.drop, keep_owner=body.keep_owner, n_dbs=len(dbs),
         )
         if body.mode == "clone":
             dest = store.get(body.dest)
         elif body.mode == "archive":
             dest = store.get(body.dest) if body.dest else source
+        elif body.mode == "agent":
+            agent_profile = agents.get(body.agent)
+            dest = None
         else:
             dest = None
 
@@ -237,6 +379,16 @@ def create_app() -> FastAPI:
                 elif body.mode == "archive":
                     r = backup_mod.backup_to_archive(
                         catalog, source, db, dest, archive_db=body.archive_db, note=body.note
+                    )
+                elif body.mode == "agent":
+                    r = backup_mod.backup_to_agent(
+                        catalog,
+                        source,
+                        db,
+                        agent_profile,
+                        fmt=fmt,
+                        note=body.note,
+                        keep_owner=body.keep_owner,
                     )
                 else:
                     r = backup_mod.backup_to_file(
@@ -260,10 +412,80 @@ def create_app() -> FastAPI:
             return restore_mod.restore_version(
                 catalog, store, body.version_id, dest,
                 dest_db=body.db, drop=body.drop, keep_owner=body.keep_owner,
+                agents=agents,
             )
 
         title = f"リストア: {body.version_id} -> {body.dest}:{body.db or rec['db']}"
         return {"job_id": jobs.submit("restore", title, run)}
+
+    @app.post("/api/agent-pull")
+    def agent_pull(body: AgentPullIn):
+        agent_profile = agents.get(body.agent)
+
+        def run(log):
+            log(f"{body.agent}:{body.remote_profile}/{body.db} を手元へ取得中")
+            return backup_mod.backup_agent_database_to_file(
+                catalog,
+                agent_profile,
+                body.remote_profile,
+                body.db,
+                fmt=body.fmt,
+                note=body.note,
+                keep_owner=body.keep_owner,
+            )
+
+        return {
+            "job_id": jobs.submit(
+                "backup",
+                f"エージェントから取得: {body.agent}:{body.remote_profile}/{body.db}",
+                run,
+            )
+        }
+
+    @app.post("/api/agent-snapshot")
+    def agent_snapshot(body: AgentSnapshotIn):
+        client = AgentClient(agents.get(body.agent))
+
+        def run(log):
+            log(f"{body.agent} 内で {body.remote_profile}/{body.db} をスナップショット中")
+            return client.create_snapshot(
+                body.remote_profile,
+                body.db,
+                version_id=body.version_id,
+                fmt=body.fmt,
+                keep_owner=body.keep_owner,
+                note=body.note,
+            )
+
+        return {
+            "job_id": jobs.submit(
+                "backup",
+                f"エージェント内スナップショット: {body.agent}/{body.db}",
+                run,
+            )
+        }
+
+    @app.post("/api/agent-remote-restore")
+    def agent_remote_restore(body: AgentRemoteRestoreIn):
+        client = AgentClient(agents.get(body.agent))
+
+        def run(log):
+            log(f"{body.backup_id} を {body.remote_profile}:{body.db or '(元DB名)'} に復元中")
+            return client.restore_remote_backup(
+                body.backup_id,
+                body.remote_profile,
+                dest_db=body.db,
+                drop=body.drop,
+                keep_owner=body.keep_owner,
+            )
+
+        return {
+            "job_id": jobs.submit(
+                "restore",
+                f"エージェント側リストア: {body.agent}:{body.backup_id}",
+                run,
+            )
+        }
 
     @app.post("/api/restore-file")
     def do_restore_file(body: RestoreFileIn):
