@@ -38,6 +38,9 @@ node bin/pgbackup.js restore local/shop_db@v1 --dest remote --db shop_db_restore
 node bin/pgbackup.js web                                              # Web UI (http://127.0.0.1:8501)
 ```
 
+復元・複製は同じ `PGBACKUP_HOME` を使う job 間で直列化します。
+別のデータ領域や別ホストから同じ PostgreSQL クラスタを操作する場合は、この排他の対象外です。
+
 行編集・比較・merge/syncもPython版と同じです:
 
 ```bash

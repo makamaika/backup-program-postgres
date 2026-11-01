@@ -9,6 +9,7 @@ import pg from "pg";
 
 import { profileDisplay } from "./config.js";
 import { PgBackupError } from "./errors.js";
+import { withReplacementLock } from "./restore-lock.js";
 
 const { Client } = pg;
 
@@ -181,37 +182,43 @@ export async function sameCluster(a, b) {
 // fn が失敗したら新 DB を消して退避 DB を元に戻し、成功したら退避 DB を削除する。
 // 途中失敗で「空の DB だけが残る」事故を防ぐ。
 export async function withReplaceDatabase(profile, dbname, { drop = false, encoding = null }, fn) {
-  let trash = null;
-  if (await databaseExists(profile, dbname)) {
-    if (!drop) {
-      throw new PgBackupError(
-        `データベース '${dbname}' は ${profileDisplay(profile)} に既に存在します。` +
-        "上書きするには --drop を指定してください。"
-      );
+  // 同じデータ領域の job を DB 操作から後片付けまで直列化する。
+  // DB 側に新しい CONNECT 権限を要求せず、置換対象も制限しない。
+  return withReplacementLock(async () => {
+    let trash = null;
+    if (await databaseExists(profile, dbname)) {
+      if (!drop) {
+        throw new PgBackupError(
+          `データベース '${dbname}' は ${profileDisplay(profile)} に既に存在します。` +
+          "上書きするには --drop を指定してください。"
+        );
+      }
+      trash = trashName(dbname);
+      await renameDatabase(profile, dbname, trash);
     }
-    trash = trashName(dbname);
-    await renameDatabase(profile, dbname, trash);
-  }
-  // Ctrl+C の既定動作 (即プロセス終了) では退避 DB が置き去りになる。
-  // クリティカルセクション中はシグナルでの即死を防ぎ、子プロセスの死による
-  // 失敗経路 (下の catch) にロールバックさせてから終了コード 130 で抜ける。
-  let interrupted = false;
-  const onSignal = () => { interrupted = true; };
-  process.on("SIGINT", onSignal);
-  process.on("SIGTERM", onSignal);
-  try {
-    await createDatabase(profile, dbname, encoding);
-    const result = await fn();
-    if (trash !== null) await dropDatabase(profile, trash).catch(() => {});
-    return result;
-  } catch (e) {
-    // 失敗: 作りかけの DB を消し、退避していた元 DB を戻す
-    await dropDatabase(profile, dbname).catch(() => {});
-    if (trash !== null) await renameDatabase(profile, trash, dbname).catch(() => {});
-    throw e;
-  } finally {
-    process.removeListener("SIGINT", onSignal);
-    process.removeListener("SIGTERM", onSignal);
-    if (interrupted) process.exitCode = 130;
-  }
+    // Ctrl+C の既定動作 (即プロセス終了) では退避 DB が置き去りになる。
+    // クリティカルセクション中はシグナルでの即死を防ぎ、子プロセスの死による
+    // 失敗経路 (下の catch) にロールバックさせてから終了コード 130 で抜ける。
+    let interrupted = false;
+    let created = false;
+    const onSignal = () => { interrupted = true; };
+    process.on("SIGINT", onSignal);
+    process.on("SIGTERM", onSignal);
+    try {
+      await createDatabase(profile, dbname, encoding);
+      created = true;
+      const result = await fn();
+      if (trash !== null) await dropDatabase(profile, trash).catch(() => {});
+      return result;
+    } catch (e) {
+      // CREATE が成功したと確認できた DB だけ削除する。
+      if (created) await dropDatabase(profile, dbname).catch(() => {});
+      if (trash !== null) await renameDatabase(profile, trash, dbname).catch(() => {});
+      throw e;
+    } finally {
+      process.removeListener("SIGINT", onSignal);
+      process.removeListener("SIGTERM", onSignal);
+      if (interrupted) process.exitCode = 130;
+    }
+  });
 }

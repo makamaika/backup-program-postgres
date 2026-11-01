@@ -118,14 +118,9 @@ export async function resolveTargetDbs(profile, dbs, allDbs = false, archiveDb =
 function resolveOutPath(out, profile, db, versionNo, fmt) {
   const ext = fmt === "plain" ? "sql" : "dump";
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "").replace("T", "T");
-  const autoName = `${safeName(db)}_v${versionNo}_${stamp}.${ext}`;
+  const autoName = `${safeName(db)}_v${versionNo}_${stamp}_${crypto.randomBytes(6).toString("hex")}.${ext}`;
   if (out === null || out === undefined) {
-    let p = path.join(backupsDir(), safeName(profile.name), safeName(db), autoName);
-    if (fs.existsSync(p)) {
-      // safeName で別 DB 名が同じ表記に潰れた場合等でも上書きしない
-      p = p.replace(`.${ext}`, `_${crypto.randomBytes(2).toString("hex")}.${ext}`);
-    }
-    return p;
+    return path.join(backupsDir(), safeName(profile.name), safeName(db), autoName);
   }
   const isDir = (fs.existsSync(out) && fs.statSync(out).isDirectory()) || /[\\/]$/.test(String(out));
   if (isDir) return path.join(String(out), autoName);
@@ -133,6 +128,20 @@ function resolveOutPath(out, profile, db, versionNo, fmt) {
     throw new BackupError(`出力先 ${out} は既に存在します。上書きを避けるため別のパスを指定してください。`);
   }
   return String(out);
+}
+
+export function reserveOutPath(out, profile, db, versionNo, fmt) {
+  const output = resolveOutPath(out, profile, db, versionNo, fmt);
+  fs.mkdirSync(path.dirname(output), { recursive: true });
+  try {
+    fs.closeSync(fs.openSync(output, "wx", 0o600));
+  } catch (e) {
+    if (e.code === "EEXIST") {
+      throw new BackupError(`出力先 ${output} は既に存在します。上書きを避けるため別のパスを指定してください。`);
+    }
+    throw e;
+  }
+  return output;
 }
 
 // pg_dump でファイルへバックアップし、バージョンをカタログに登録する
@@ -145,7 +154,7 @@ export async function backupToFile(catalog, profile, db, {
   let rec = catalog.reserveVersion(profile.name, db, "file", fmt);
   let outPath = null;
   try {
-    outPath = resolveOutPath(out, profile, db, rec.version_no, fmt);
+    outPath = reserveOutPath(out, profile, db, rec.version_no, fmt);
     await pgtools.dumpToFile(profile, db, outPath, fmt, keepOwner);
     rec = catalog.finalizeBackup(rec.id, {
       location: path.resolve(outPath),
@@ -266,9 +275,9 @@ export async function backupAgentDatabaseToFile(catalog, agent, remoteProfile, d
   let rec = catalog.reserveVersion(agent.name, db, "file", fmt);
   let outPath = null;
   try {
-    outPath = resolveOutPath(out, agent, db, rec.version_no, fmt);
+    outPath = reserveOutPath(out, agent, db, rec.version_no, fmt);
     const meta = await new AgentClient(agent).downloadDatabase(remoteProfile, db, outPath, {
-      fmt, keepOwner,
+      fmt, keepOwner, replaceReserved: true,
     });
     rec = catalog.finalizeBackup(rec.id, {
       location: path.resolve(outPath), size: meta.size, sha256: meta.sha256, note,

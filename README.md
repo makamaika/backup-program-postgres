@@ -139,6 +139,9 @@ pgbackup data apply local shop_db edit_source \
   --confirm 'local@localhost:5432/shop_db/public.edit_target'
 ```
 
+復元・複製は同じ `PGBACKUP_HOME` を使う job 間で直列化します。
+別のデータ領域や別ホストから同じ PostgreSQL クラスタを操作する場合は、この排他の対象外です。
+
 ## Web UI
 
 ```bash

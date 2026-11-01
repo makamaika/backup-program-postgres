@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import uuid
 from datetime import datetime, timezone
@@ -139,7 +140,7 @@ def _resolve_out_path(
 ) -> Path:
     ext = "sql" if fmt == "plain" else "dump"
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    auto_name = f"{_safe_name(db)}_v{version_no}_{stamp}.{ext}"
+    auto_name = f"{_safe_name(db)}_v{version_no}_{stamp}_{uuid.uuid4().hex[:12]}.{ext}"
     if out is None:
         return backups_dir() / _safe_name(profile.name) / _safe_name(db) / auto_name
     if out.is_dir() or str(out).endswith(("/", "\\")):
@@ -149,6 +150,21 @@ def _resolve_out_path(
             f"出力先 {out} は既に存在します。上書きを避けるため別のパスを指定してください。"
         )
     return out
+
+
+def _reserve_out_path(out: Path | None, profile: Profile, db: str,
+                      version_no: int, fmt: str) -> Path:
+    """出力先を排他的に確保する。失敗時は呼び出し元に所有権を渡さない。"""
+    path = _resolve_out_path(out, profile, db, version_no, fmt)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as exc:
+        raise BackupError(
+            f"出力先 {path} は既に存在します。上書きを避けるため別のパスを指定してください。"
+        ) from exc
+    os.close(fd)
+    return path
 
 
 def backup_to_file(
@@ -166,7 +182,7 @@ def backup_to_file(
     rec = catalog.reserve_version(profile.name, db, mode="file", fmt=fmt)
     out_path: Path | None = None
     try:
-        out_path = _resolve_out_path(out, profile, db, rec["version_no"], fmt)
+        out_path = _reserve_out_path(out, profile, db, rec["version_no"], fmt)
         pgtools.dump_to_file(profile, db, out_path, fmt=fmt, keep_owner=keep_owner)
         rec = catalog.finalize_backup(
             rec["id"],
@@ -344,13 +360,14 @@ def backup_agent_database_to_file(
     rec = catalog.reserve_version(agent.name, db, mode="file", fmt=fmt)
     out_path: Path | None = None
     try:
-        out_path = _resolve_out_path(out, agent, db, rec["version_no"], fmt)
+        out_path = _reserve_out_path(out, agent, db, rec["version_no"], fmt)
         meta = AgentClient(agent).download_database(
             remote_profile,
             db,
             out_path,
             fmt=fmt,
             keep_owner=keep_owner,
+            replace_reserved=True,
         )
         rec = catalog.finalize_backup(
             rec["id"],

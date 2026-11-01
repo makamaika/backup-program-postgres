@@ -1,0 +1,30 @@
+name: Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  regressions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -e .
+      - run: python -m unittest discover -s tests -p test_collision_regressions.py -v
+      - run: python -m compileall -q pgbackup tests/test_collision_regressions.py
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - run: npm ci --prefix nodejs --ignore-scripts
+      - run: node --test nodejs/tests/collision_regressions.test.js
+      - run: node --check nodejs/src/db.js && node --check nodejs/src/backup.js && node --check nodejs/src/agent.js && node --check nodejs/src/restore-lock.js
