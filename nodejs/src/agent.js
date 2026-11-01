@@ -106,12 +106,13 @@ async function requestJson(profile, method, endpoint, query = null) {
   catch { throw new AgentError("エージェントから不正な JSON 応答を受信しました"); }
 }
 
-async function saveResponse(res, destination, expectedSha = null) {
-  if (fs.existsSync(destination)) throw new AgentError(`出力先は既に存在します: ${destination}`);
+export async function saveResponse(res, destination, expectedSha = null, replaceReserved = false) {
+  if (fs.existsSync(destination) && !replaceReserved) throw new AgentError(`出力先は既に存在します: ${destination}`);
   fs.mkdirSync(path.dirname(destination), { recursive: true });
   const temp = `${destination}.${crypto.randomBytes(6).toString("hex")}.part`;
   const hash = crypto.createHash("sha256");
   let size = 0;
+  let tempCreated = false;
   try {
     const meter = new Transform({
       transform(chunk, encoding, callback) {
@@ -120,7 +121,9 @@ async function saveResponse(res, destination, expectedSha = null) {
         callback(null, chunk);
       },
     });
-    await pipeline(res, meter, fs.createWriteStream(temp, { flags: "wx" }));
+    const output = fs.createWriteStream(temp, { flags: "wx" });
+    output.on("open", () => { tempCreated = true; });
+    await pipeline(res, meter, output);
     const digest = hash.digest("hex");
     const expected = expectedSha || res.headers["x-pgbackup-sha256"];
     if (expected && expected !== digest) {
@@ -129,7 +132,7 @@ async function saveResponse(res, destination, expectedSha = null) {
     fs.renameSync(temp, destination);
     return { size, sha256: digest };
   } finally {
-    fs.rmSync(temp, { force: true });
+    if (tempCreated) fs.rmSync(temp, { force: true });
   }
 }
 
@@ -226,7 +229,9 @@ export class AgentClient {
     });
   }
 
-  async downloadDatabase(remoteProfile, db, destination, { fmt = "custom", keepOwner = false } = {}) {
+  async downloadDatabase(remoteProfile, db, destination, {
+    fmt = "custom", keepOwner = false, replaceReserved = false,
+  } = {}) {
     const body = Buffer.from(JSON.stringify({ profile: remoteProfile, db, fmt, keep_owner: keepOwner }));
     const result = await new Promise((resolve, reject) => {
       const req = https.request(makeUrl(this.profile, "/v1/dump"), optionsFor(this.profile, "POST", {
@@ -234,7 +239,7 @@ export class AgentClient {
       }), async (res) => {
         try {
           if (res.statusCode < 200 || res.statusCode >= 300) throw await responseError(res);
-          resolve(await saveResponse(res, destination));
+          resolve(await saveResponse(res, destination, null, replaceReserved));
         } catch (err) { reject(err); }
       });
       req.setTimeout(3600000, () => req.destroy(new AgentError("DB 取得がタイムアウトしました")));

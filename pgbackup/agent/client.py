@@ -214,17 +214,20 @@ class AgentClient:
             raise AgentError("アップロード後の応答が不正です") from exc
 
     def _download_response(
-        self, response, destination: Path, *, expected_sha256: str | None = None
+        self, response, destination: Path, *, expected_sha256: str | None = None,
+        replace_reserved: bool = False,
     ) -> tuple[int, str]:
         destination = Path(destination)
-        if destination.exists():
+        if destination.exists() and not replace_reserved:
             raise AgentError(f"出力先は既に存在します: {destination}")
         destination.parent.mkdir(parents=True, exist_ok=True)
         temp = destination.with_name(destination.name + ".part")
         digest = hashlib.sha256()
         size = 0
+        temp_created = False
         try:
             with open(temp, "xb") as file:
+                temp_created = True
                 while chunk := response.read(1024 * 1024):
                     file.write(chunk)
                     digest.update(chunk)
@@ -240,7 +243,8 @@ class AgentClient:
             os.replace(temp, destination)
             return size, actual
         finally:
-            temp.unlink(missing_ok=True)
+            if temp_created:
+                temp.unlink(missing_ok=True)
 
     def download_backup(self, backup_id: str, destination: Path) -> dict:
         record = self.get_backup(backup_id)
@@ -303,6 +307,7 @@ class AgentClient:
         *,
         fmt: str = "custom",
         keep_owner: bool = False,
+        replace_reserved: bool = False,
     ) -> dict:
         body = json.dumps(
             {
@@ -319,7 +324,9 @@ class AgentClient:
             headers={"Content-Type": "application/json"},
             timeout=max(self.timeout, 3600),
         ) as response:
-            size, digest = self._download_response(response, destination)
+            size, digest = self._download_response(
+                response, destination, replace_reserved=replace_reserved
+            )
         return {"size": size, "sha256": digest, "fmt": fmt}
 
     def create_snapshot(

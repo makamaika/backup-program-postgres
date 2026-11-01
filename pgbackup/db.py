@@ -10,6 +10,7 @@ from psycopg import sql
 
 from .config import Profile
 from .errors import PgBackupError
+from .restore_lock import replacement_lock
 
 CONNECT_TIMEOUT = 10
 
@@ -132,33 +133,39 @@ def replace_database(profile: Profile, dbname: str, drop: bool = False,
     with ブロックが失敗したら新 DB を消して退避 DB を元に戻し、
     成功したら退避 DB を削除する。途中失敗で「空の DB だけが残る」事故を防ぐ。
     """
-    trash: str | None = None
-    if database_exists(profile, dbname):
-        if not drop:
-            raise PgBackupError(
-                f"データベース '{dbname}' は {profile.display()} に既に存在します。"
-                "上書きするには --drop を指定してください。"
-            )
-        trash = _trash_name(dbname)
-        rename_database(profile, dbname, trash)
-    try:
-        create_database(profile, dbname, encoding=encoding)
-        yield
-    except BaseException:
-        # 失敗: 作りかけの DB を消し、退避していた元 DB を戻す
+    # 同じデータ領域の job を DB 操作から後片付けまで直列化する。
+    # DB 側に新しい CONNECT 権限を要求せず、置換対象も制限しない。
+    with replacement_lock():
+        trash: str | None = None
+        created = False
+        if database_exists(profile, dbname):
+            if not drop:
+                raise PgBackupError(
+                    f"データベース '{dbname}' は {profile.display()} に既に存在します。"
+                    "上書きするには --drop を指定してください。"
+                )
+            trash = _trash_name(dbname)
+            rename_database(profile, dbname, trash)
         try:
-            drop_database(profile, dbname)
-        except psycopg.Error:
-            pass
-        if trash is not None:
-            try:
-                rename_database(profile, trash, dbname)
-            except psycopg.Error:
-                pass
-        raise
-    else:
-        if trash is not None:
-            try:
-                drop_database(profile, trash)
-            except psycopg.Error:
-                pass
+            create_database(profile, dbname, encoding=encoding)
+            created = True
+            yield
+        except BaseException:
+            # CREATE に成功した場合だけ、自分の作成した DB を片付ける。
+            if created:
+                try:
+                    drop_database(profile, dbname)
+                except psycopg.Error:
+                    pass
+            if trash is not None:
+                try:
+                    rename_database(profile, trash, dbname)
+                except psycopg.Error:
+                    pass
+            raise
+        else:
+            if trash is not None:
+                try:
+                    drop_database(profile, trash)
+                except psycopg.Error:
+                    pass
